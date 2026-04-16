@@ -102,47 +102,19 @@ function setCorsHeaders(res) {
 }
 
 /**
- * Konversi media (gambar/GIF/video) ke animated WebP menggunakan ffmpeg
+ * Konversi media (gambar/GIF/video) ke WebP menggunakan ffmpeg
  * @param {string} url - URL file media
  * @param {number} quality - Kualitas WebP (0-100)
  * @returns {Promise<Buffer>} - Buffer hasil konversi WebP
  */
-async function convertToWebP(url, quality = 80) {
-  // Batasan
-  const MAX_DURATION_SEC = 10;   // Maksimal durasi video 10 detik
-  const MAX_SIZE_MB = 15;        // Maksimal ukuran file asli 15 MB
-
-  // Download file ke buffer terlebih dahulu
-  let fileBuffer;
-  try {
-    const response = await axios({
-      method: "GET",
-      url: url,
-      responseType: "arraybuffer",
-      maxContentLength: MAX_SIZE_MB * 1024 * 1024,
-      timeout: 30000, // 30 detik timeout download
-    });
-    fileBuffer = Buffer.from(response.data);
-  } catch (err) {
-    throw new Error(`Gagal download file: ${err.message}`);
-  }
-
-  // Cek durasi menggunakan ffprobe dari buffer
-  const duration = await new Promise((resolve, reject) => {
-    ffmpeg.ffprobe(fileBuffer, (err, metadata) => {
-      if (err) return reject(new Error(`ffprobe gagal: ${err.message}`));
-      const dur = metadata.format.duration || 0;
-      resolve(dur);
-    });
+async function convertToWebP1(url, quality = 80) {
+  const response = await axios({
+    method: "GET",
+    url: url,
+    responseType: "stream",
   });
 
-  if (duration > MAX_DURATION_SEC) {
-    throw new Error(
-      `Durasi video terlalu panjang: ${duration.toFixed(2)} detik (maks ${MAX_DURATION_SEC} detik)`
-    );
-  }
-
-  // Konversi buffer ke animated WebP
+  const inputStream = response.data;
   const outputStream = new PassThrough();
   const chunks = [];
 
@@ -151,18 +123,45 @@ async function convertToWebP(url, quality = 80) {
     outputStream.on("end", () => resolve(Buffer.concat(chunks)));
     outputStream.on("error", reject);
 
-    ffmpeg(fileBuffer)
+    ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      // 🔽 Filter scale untuk stretch ke 512x512 (dipertahankan)
-      .videoFilter("scale=512:512,setpts=PTS") 
+      // 🔽 Tambahkan filter scale untuk stretch ke 512x512
+      .videoFilter("scale=512:512") 
       .outputOptions([
-        "-c:v libwebp_anim",      // encoder animasi
+        "-c:v libwebp",
+        `-quality ${quality}`,
+        "-loop 0",
+        "-preset default",
+        "-an", // hapus audio
+      ])
+      .format("webp")
+      .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
+      .pipe(outputStream, { end: true });
+  });
+}
+
+async function convertToWebP(url, quality = 80) {
+  const response = await axios({ method: "GET", url, responseType: "stream" });
+  const inputStream = response.data;
+  const outputStream = new PassThrough();
+  const chunks = [];
+
+  return new Promise((resolve, reject) => {
+    outputStream.on("data", (chunk) => chunks.push(chunk));
+    outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outputStream.on("error", reject);
+
+    ffmpeg(inputStream)
+      .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
+      .videoFilter("scale=512:512") // stretch tetap dipertahankan
+      .outputOptions([
+        "-c:v libwebp_anim",      // gunakan encoder animasi
         `-quality ${quality}`,
         "-loop 0",                // looping tak terbatas
         "-vsync 0",               // pertahankan timing asli
-        "-g 1",                   // keyframe tiap frame
-        "-pix_fmt yuv420p",       // kompatibilitas
-        "-an",                    // hapus audio
+        "-g 1",                   // keyframe tiap frame (animasi lancar)
+        "-pix_fmt yuv420p",       // kompatibilitas maksimal
+        "-an"                     // hapus audio
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
@@ -179,7 +178,7 @@ module.exports = async (req, res) => {
 
   const { type } = req.query;
 
-  // --- CONVERT MEDIA TO ANIMATED WEBP (GET dengan URL) ---
+  // --- CONVERT MEDIA TO WEBP (GET dengan URL) ---
   if (type === "convert") {
     if (req.method !== "GET") {
       return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
