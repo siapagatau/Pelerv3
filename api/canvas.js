@@ -102,20 +102,47 @@ function setCorsHeaders(res) {
 }
 
 /**
- * Konversi media (gambar/GIF/video) ke WebP (animasi jika sumbernya animasi)
+ * Konversi media (gambar/GIF/video) ke animated WebP menggunakan ffmpeg
  * @param {string} url - URL file media
  * @param {number} quality - Kualitas WebP (0-100)
- * @param {number} fps - Frame rate untuk animasi (default 10)
  * @returns {Promise<Buffer>} - Buffer hasil konversi WebP
  */
-async function convertToWebP(url, quality = 80, fps = 10) {
-  const response = await axios({
-    method: "GET",
-    url: url,
-    responseType: "stream",
+async function convertToWebP(url, quality = 80) {
+  // Batasan
+  const MAX_DURATION_SEC = 10;   // Maksimal durasi video 10 detik
+  const MAX_SIZE_MB = 15;        // Maksimal ukuran file asli 15 MB
+
+  // Download file ke buffer terlebih dahulu
+  let fileBuffer;
+  try {
+    const response = await axios({
+      method: "GET",
+      url: url,
+      responseType: "arraybuffer",
+      maxContentLength: MAX_SIZE_MB * 1024 * 1024,
+      timeout: 30000, // 30 detik timeout download
+    });
+    fileBuffer = Buffer.from(response.data);
+  } catch (err) {
+    throw new Error(`Gagal download file: ${err.message}`);
+  }
+
+  // Cek durasi menggunakan ffprobe dari buffer
+  const duration = await new Promise((resolve, reject) => {
+    ffmpeg.ffprobe(fileBuffer, (err, metadata) => {
+      if (err) return reject(new Error(`ffprobe gagal: ${err.message}`));
+      const dur = metadata.format.duration || 0;
+      resolve(dur);
+    });
   });
 
-  const inputStream = response.data;
+  if (duration > MAX_DURATION_SEC) {
+    throw new Error(
+      `Durasi video terlalu panjang: ${duration.toFixed(2)} detik (maks ${MAX_DURATION_SEC} detik)`
+    );
+  }
+
+  // Konversi buffer ke animated WebP
   const outputStream = new PassThrough();
   const chunks = [];
 
@@ -124,16 +151,18 @@ async function convertToWebP(url, quality = 80, fps = 10) {
     outputStream.on("end", () => resolve(Buffer.concat(chunks)));
     outputStream.on("error", reject);
 
-    // Gunakan libwebp_anim untuk animasi, dan filter fps untuk mengatur kecepatan
-    ffmpeg(inputStream)
+    ffmpeg(fileBuffer)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      .videoFilter(`fps=${fps},scale=512:512`) // atur fps dan resize
+      // 🔽 Filter scale untuk stretch ke 512x512 (dipertahankan)
+      .videoFilter("scale=512:512,setpts=PTS") 
       .outputOptions([
-        "-c:v libwebp_anim", // encoder untuk WebP animasi
+        "-c:v libwebp_anim",      // encoder animasi
         `-quality ${quality}`,
-        "-loop 0",           // loop forever
-        "-preset default",
-        "-an",               // hapus audio
+        "-loop 0",                // looping tak terbatas
+        "-vsync 0",               // pertahankan timing asli
+        "-g 1",                   // keyframe tiap frame
+        "-pix_fmt yuv420p",       // kompatibilitas
+        "-an",                    // hapus audio
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
@@ -150,13 +179,13 @@ module.exports = async (req, res) => {
 
   const { type } = req.query;
 
-  // --- CONVERT MEDIA TO WEBP (GET dengan URL) ---
+  // --- CONVERT MEDIA TO ANIMATED WEBP (GET dengan URL) ---
   if (type === "convert") {
     if (req.method !== "GET") {
       return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
     }
 
-    const { url, quality, fps } = req.query;
+    const { url, quality } = req.query;
     if (!url) {
       return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
     }
@@ -173,13 +202,8 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Quality harus antara 0-100." });
     }
 
-    const f = parseInt(fps) || 10;
-    if (f < 1 || f > 60) {
-      return res.status(400).json({ error: "FPS harus antara 1-60." });
-    }
-
     try {
-      const webpBuffer = await convertToWebP(url, q, f);
+      const webpBuffer = await convertToWebP(url, q);
       res.setHeader("Content-Type", "image/webp");
       res.setHeader("Cache-Control", "public, max-age=3600");
       res.send(webpBuffer);
