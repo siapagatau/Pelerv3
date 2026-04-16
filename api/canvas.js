@@ -10,11 +10,11 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const axios = require("axios");
 const { PassThrough } = require("stream");
-const fs = require("fs");
-const os = require("os");
-const path = require("path"); // <-- tambahkan ini
+const path = require("path");
 
+// Set path ffmpeg
 ffmpeg.setFfmpegPath(ffmpegPath);
+
 Font.loadDefault();
 
 // ---------- Custom Greetings Card (tidak berubah) ----------
@@ -102,57 +102,75 @@ function setCorsHeaders(res) {
 }
 
 /**
- * Konversi media (GIF/video) ke animated WebP
- * Menggunakan file temporary agar ffmpeg bisa membaca semua frame
+ * Konversi media (gambar/GIF/video) ke WebP menggunakan ffmpeg
+ * @param {string} url - URL file media
+ * @param {number} quality - Kualitas WebP (0-100)
+ * @returns {Promise<Buffer>} - Buffer hasil konversi WebP
  */
-async function convertToWebP(url, quality = 80) {
-  const MAX_DURATION_SEC = 10;
-  const MAX_SIZE_MB = 15;
+async function convertToWebP1(url, quality = 80) {
+  const response = await axios({
+    method: "GET",
+    url: url,
+    responseType: "stream",
+  });
 
-  // 1. Download file ke buffer
-  let fileBuffer;
-  try {
-    const response = await axios({
-      method: "GET",
-      url,
-      responseType: "arraybuffer",
-      maxContentLength: MAX_SIZE_MB * 1024 * 1024,
-      timeout: 30000,
-    });
-    fileBuffer = Buffer.from(response.data);
-  } catch (err) {
-    throw new Error(`Gagal download: ${err.message}`);
-  }
-
-  // 2. Simpan ke file temporary
-  const tempInput = path.join(os.tmpdir(), `input_${Date.now()}_${Math.random().toString(36)}.tmp`);
-  fs.writeFileSync(tempInput, fileBuffer);
-
-  // 3. Konversi ke animated WebP
+  const inputStream = response.data;
   const outputStream = new PassThrough();
   const chunks = [];
 
   return new Promise((resolve, reject) => {
     outputStream.on("data", (chunk) => chunks.push(chunk));
-    outputStream.on("end", () => {
-      fs.unlinkSync(tempInput);
-      resolve(Buffer.concat(chunks));
-    });
-    outputStream.on("error", (err) => {
-      try { fs.unlinkSync(tempInput); } catch(e) {}
-      reject(err);
-    });
+    outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outputStream.on("error", reject);
 
-    ffmpeg(tempInput)
-      .videoFilter("scale=512:512")
+    ffmpeg(inputStream)
+      .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
+      // 🔽 Tambahkan filter scale untuk stretch ke 512x512
+      .videoFilter("scale=512:512") 
+      .outputOptions([
+        "-c:v libwebp",
+        `-quality ${quality}`,
+        "-loop 0",
+        "-preset default",
+        "-an", // hapus audio
+      ])
+      .format("webp")
+      .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
+      .pipe(outputStream, { end: true });
+  });
+}
+
+async function convertToWebP(url, quality = 80) {
+  const response = await axios({ method: "GET", url, responseType: "stream" });
+  const inputStream = response.data;
+  const outputStream = new PassThrough();
+  const chunks = [];
+
+  return new Promise((resolve, reject) => {
+    outputStream.on("data", (chunk) => chunks.push(chunk));
+    outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outputStream.on("error", reject);
+
+    ffmpeg(inputStream)
+      .inputOptions([
+        "-analyzeduration 10M",
+        "-probesize 10M",
+        "-f gif",               // paksa format GIF (hindari deteksi salah)
+      ])
+      .videoFilter([
+        "scale=512:512:flags=lanczos",  // scale dengan lanczos (lebih halus)
+        "fps=15",                       // batasi framerate (opsional, sesuaikan)
+        "setpts=PTS-STARTPTS",          // reset timestamp
+      ])
       .outputOptions([
         "-c:v libwebp_anim",
         `-quality ${quality}`,
         "-loop 0",
-        "-vsync 0",
-        "-g 1",
-        "-pix_fmt yuv420p",
-        "-an"
+        "-vsync 0",                     // pertahankan timing asli
+        "-g 1",                         // keyframe tiap frame
+        "-pix_fmt yuva420p",            // dukungan alpha (untuk transparansi)
+        "-an",                          // hapus audio
+        "-metadata:s:v rotate=0",       // cegah rotasi otomatis
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
@@ -162,20 +180,35 @@ async function convertToWebP(url, quality = 80) {
 
 module.exports = async (req, res) => {
   setCorsHeaders(res);
-  if (req.method === "OPTIONS") return res.status(200).end();
+
+  if (req.method === "OPTIONS") {
+    return res.status(200).end();
+  }
 
   const { type } = req.query;
 
-  // --- CONVERT MEDIA TO WEBP (GET) ---
+  // --- CONVERT MEDIA TO WEBP (GET dengan URL) ---
   if (type === "convert") {
     if (req.method !== "GET") {
-      return res.status(405).json({ error: "Convert hanya GET." });
+      return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
     }
+
     const { url, quality } = req.query;
-    if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-    try { new URL(url); } catch { return res.status(400).json({ error: "URL tidak valid." }); }
+    if (!url) {
+      return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
+    }
+
+    // Validasi URL
+    try {
+      new URL(url);
+    } catch {
+      return res.status(400).json({ error: "URL tidak valid." });
+    }
+
     const q = parseInt(quality) || 80;
-    if (q < 0 || q > 100) return res.status(400).json({ error: "Quality 0-100." });
+    if (q < 0 || q > 100) {
+      return res.status(400).json({ error: "Quality harus antara 0-100." });
+    }
 
     try {
       const webpBuffer = await convertToWebP(url, q);
@@ -194,24 +227,31 @@ module.exports = async (req, res) => {
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Leaderboard requires POST method." });
     }
+
     try {
       const { header, players, background, variant } = req.body;
+
       if (!players || !Array.isArray(players)) {
         return res.status(400).json({ error: "Missing players array." });
       }
+
       const safeHeader = {
         title: header?.title || "Leaderboard",
         image: header?.image || "https://github.com/neplextech.png",
         subtitle: header?.subtitle || "0 members",
       };
+
       const limitedPlayers = players.slice(0, 10);
       const lb = new LeaderboardBuilder()
         .setHeader(safeHeader)
         .setPlayers(limitedPlayers);
+
       if (background) lb.setBackground(background);
       if (variant === "horizontal") lb.setVariant("horizontal");
       else lb.setVariant("default");
+
       const imageBuffer = await lb.build({ format: "png" });
+
       res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "public, max-age=60");
       return res.send(imageBuffer);
