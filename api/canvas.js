@@ -128,27 +128,7 @@ async function convertToWebP(url, quality = 80) {
   const tempInput = path.join(os.tmpdir(), `input_${Date.now()}_${Math.random().toString(36)}.tmp`);
   fs.writeFileSync(tempInput, fileBuffer);
 
-  // 3. Cek durasi (opsional)
-  let duration = 0;
-  try {
-    const metadata = await new Promise((resolve, reject) => {
-      ffmpeg.ffprobe(tempInput, (err, data) => {
-        if (err) reject(err);
-        else resolve(data);
-      });
-    });
-    duration = metadata?.format?.duration || 0;
-  } catch (err) {
-    fs.unlinkSync(tempInput);
-    throw new Error(`ffprobe gagal: ${err.message}`);
-  }
-
-  if (duration > MAX_DURATION_SEC) {
-    fs.unlinkSync(tempInput);
-    throw new Error(`Durasi > ${MAX_DURATION_SEC} detik (${duration.toFixed(2)})`);
-  }
-
-  // 4. Konversi ke animated WebP
+  // 3. Konversi ke animated WebP
   const outputStream = new PassThrough();
   const chunks = [];
 
