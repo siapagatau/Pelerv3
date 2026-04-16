@@ -152,25 +152,16 @@ async function convertToWebP(url, quality = 80) {
     outputStream.on("error", reject);
 
     ffmpeg(inputStream)
-      .inputOptions([
-        "-analyzeduration 10M",
-        "-probesize 10M",
-        "-f gif",               // paksa format GIF (hindari deteksi salah)
-      ])
-      .videoFilter([
-        "scale=512:512:flags=lanczos",  // scale dengan lanczos (lebih halus)
-        "fps=15",                       // batasi framerate (opsional, sesuaikan)
-        "setpts=PTS-STARTPTS",          // reset timestamp
-      ])
+      .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
+      .videoFilter("scale=512:512") // stretch tetap dipertahankan
       .outputOptions([
-        "-c:v libwebp_anim",
+        "-c:v libwebp_anim",      // gunakan encoder animasi
         `-quality ${quality}`,
-        "-loop 0",
-        "-vsync 0",                     // pertahankan timing asli
-        "-g 1",                         // keyframe tiap frame
-        "-pix_fmt yuva420p",            // dukungan alpha (untuk transparansi)
-        "-an",                          // hapus audio
-        "-metadata:s:v rotate=0",       // cegah rotasi otomatis
+        "-loop 0",                // looping tak terbatas
+        "-vsync 0",               // pertahankan timing asli
+        "-g 1",                   // keyframe tiap frame (animasi lancar)
+        "-pix_fmt yuv420p",       // kompatibilitas maksimal
+        "-an"                     // hapus audio
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
