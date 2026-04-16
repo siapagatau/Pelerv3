@@ -102,12 +102,13 @@ function setCorsHeaders(res) {
 }
 
 /**
- * Konversi media (gambar/GIF/video) ke WebP menggunakan ffmpeg
+ * Konversi media (gambar/GIF/video) ke WebP (animasi jika sumbernya animasi)
  * @param {string} url - URL file media
  * @param {number} quality - Kualitas WebP (0-100)
+ * @param {number} fps - Frame rate untuk animasi (default 10)
  * @returns {Promise<Buffer>} - Buffer hasil konversi WebP
  */
-async function convertToWebP(url, quality = 80) {
+async function convertToWebP(url, quality = 80, fps = 10) {
   const response = await axios({
     method: "GET",
     url: url,
@@ -123,16 +124,16 @@ async function convertToWebP(url, quality = 80) {
     outputStream.on("end", () => resolve(Buffer.concat(chunks)));
     outputStream.on("error", reject);
 
+    // Gunakan libwebp_anim untuk animasi, dan filter fps untuk mengatur kecepatan
     ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      // 🔽 Tambahkan filter scale untuk stretch ke 512x512
-      .videoFilter("scale=512:512") 
+      .videoFilter(`fps=${fps},scale=512:512`) // atur fps dan resize
       .outputOptions([
-        "-c:v libwebp",
+        "-c:v libwebp_anim", // encoder untuk WebP animasi
         `-quality ${quality}`,
-        "-loop 0",
+        "-loop 0",           // loop forever
         "-preset default",
-        "-an", // hapus audio
+        "-an",               // hapus audio
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
@@ -155,7 +156,7 @@ module.exports = async (req, res) => {
       return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
     }
 
-    const { url, quality } = req.query;
+    const { url, quality, fps } = req.query;
     if (!url) {
       return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
     }
@@ -172,8 +173,13 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "Quality harus antara 0-100." });
     }
 
+    const f = parseInt(fps) || 10;
+    if (f < 1 || f > 60) {
+      return res.status(400).json({ error: "FPS harus antara 1-60." });
+    }
+
     try {
-      const webpBuffer = await convertToWebP(url, q);
+      const webpBuffer = await convertToWebP(url, q, f);
       res.setHeader("Content-Type", "image/webp");
       res.setHeader("Cache-Control", "public, max-age=3600");
       res.send(webpBuffer);
