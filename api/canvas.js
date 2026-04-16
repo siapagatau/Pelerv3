@@ -12,6 +12,7 @@ const axios = require("axios");
 const { PassThrough } = require("stream");
 const fs = require("fs");
 const os = require("os");
+const path = require("path"); // <-- tambahkan ini
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 Font.loadDefault();
@@ -127,7 +128,7 @@ async function convertToWebP(url, quality = 80) {
   const tempInput = path.join(os.tmpdir(), `input_${Date.now()}_${Math.random().toString(36)}.tmp`);
   fs.writeFileSync(tempInput, fileBuffer);
 
-  // 3. Cek durasi (opsional, untuk batasan)
+  // 3. Cek durasi (opsional)
   let duration = 0;
   try {
     const metadata = await new Promise((resolve, reject) => {
@@ -154,16 +155,16 @@ async function convertToWebP(url, quality = 80) {
   return new Promise((resolve, reject) => {
     outputStream.on("data", (chunk) => chunks.push(chunk));
     outputStream.on("end", () => {
-      fs.unlinkSync(tempInput); // bersihkan
+      fs.unlinkSync(tempInput);
       resolve(Buffer.concat(chunks));
     });
     outputStream.on("error", (err) => {
-      fs.unlinkSync(tempInput);
+      try { fs.unlinkSync(tempInput); } catch(e) {}
       reject(err);
     });
 
     ffmpeg(tempInput)
-      .videoFilter("scale=512:512") // stretch ke 512x512
+      .videoFilter("scale=512:512")
       .outputOptions([
         "-c:v libwebp_anim",
         `-quality ${quality}`,
@@ -185,6 +186,7 @@ module.exports = async (req, res) => {
 
   const { type } = req.query;
 
+  // --- CONVERT MEDIA TO WEBP (GET) ---
   if (type === "convert") {
     if (req.method !== "GET") {
       return res.status(405).json({ error: "Convert hanya GET." });
@@ -207,31 +209,50 @@ module.exports = async (req, res) => {
     return;
   }
 
-  // ... (leaderboard, rank, welcome/goodbye tetap sama seperti kode Anda)
-  // Saya sertakan bagian leaderboard dan rank dari kode Anda sebelumnya agar lengkap
+  // --- LEADERBOARD (POST) ---
   if (type === "leaderboard") {
-    if (req.method !== "POST") return res.status(405).json({ error: "Leaderboard POST." });
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Leaderboard requires POST method." });
+    }
     try {
       const { header, players, background, variant } = req.body;
-      if (!players || !Array.isArray(players)) return res.status(400).json({ error: "Missing players." });
-      const safeHeader = { title: header?.title || "Leaderboard", image: header?.image || "https://github.com/neplextech.png", subtitle: header?.subtitle || "0 members" };
+      if (!players || !Array.isArray(players)) {
+        return res.status(400).json({ error: "Missing players array." });
+      }
+      const safeHeader = {
+        title: header?.title || "Leaderboard",
+        image: header?.image || "https://github.com/neplextech.png",
+        subtitle: header?.subtitle || "0 members",
+      };
       const limitedPlayers = players.slice(0, 10);
-      const lb = new LeaderboardBuilder().setHeader(safeHeader).setPlayers(limitedPlayers);
+      const lb = new LeaderboardBuilder()
+        .setHeader(safeHeader)
+        .setPlayers(limitedPlayers);
       if (background) lb.setBackground(background);
       if (variant === "horizontal") lb.setVariant("horizontal");
+      else lb.setVariant("default");
       const imageBuffer = await lb.build({ format: "png" });
       res.setHeader("Content-Type", "image/png");
+      res.setHeader("Cache-Control", "public, max-age=60");
       return res.send(imageBuffer);
     } catch (err) {
-      return res.status(500).json({ error: "Leaderboard failed", detail: err.message });
+      console.error(err);
+      return res.status(500).json({ error: "Failed to generate leaderboard", detail: err.message });
     }
   }
 
-  if (req.method !== "GET") return res.status(405).json({ error: "Method not allowed." });
-  if (!type) return res.status(400).json({ error: "Missing type." });
+  // --- RANK, WELCOME, GOODBYE (GET) ---
+  if (req.method !== "GET") {
+    return res.status(405).json({ error: "Method not allowed. Use GET for rank/welcome/goodbye, or POST for leaderboard." });
+  }
+
+  if (!type) {
+    return res.status(400).json({ error: "Missing 'type' parameter." });
+  }
 
   try {
     let imageBuffer;
+
     if (type === "rank") {
       const { username, displayName, avatar, currentXP, requiredXP, level, rank, status, background } = req.query;
       const card = new RankCardBuilder()
@@ -243,11 +264,12 @@ module.exports = async (req, res) => {
         .setLevel(parseInt(level) || 1)
         .setRank(parseInt(rank) || 1)
         .setOverlay(90);
-      if (status && ["online","idle","dnd","offline"].includes(status)) card.setStatus(status);
+      if (status && ["online", "idle", "dnd", "offline"].includes(status)) card.setStatus(status);
       if (background) card.setBackground(background);
       else card.setBackground("#2C2F33");
       imageBuffer = await card.build({ format: "png" });
-    } else if (type === "welcome" || type === "goodbye") {
+    } 
+    else if (type === "welcome" || type === "goodbye") {
       const { displayName, avatar, message } = req.query;
       const card = new GreetingsCard()
         .setType(type)
@@ -255,12 +277,16 @@ module.exports = async (req, res) => {
         .setAvatar(avatar || "https://cdn.discordapp.com/embed/avatars/0.png")
         .setMessage(message || (type === "welcome" ? "Welcome to the server!" : "We'll miss you!"));
       imageBuffer = await card.build({ format: "png" });
-    } else {
+    } 
+    else {
       return res.status(400).json({ error: "Invalid type. Use 'welcome', 'goodbye', 'rank', or 'leaderboard'." });
     }
+
     res.setHeader("Content-Type", "image/png");
+    res.setHeader("Cache-Control", "public, max-age=60");
     res.send(imageBuffer);
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: "Failed to generate image", detail: err.message });
   }
 };
