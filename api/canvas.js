@@ -159,7 +159,7 @@ async function convertToWebP(url, quality = 80) {
         `-quality ${quality}`,
         "-loop 0",                // looping tak terbatas
         "-vsync 0",               // pertahankan timing asli
-        //"-g 1",                   // keyframe tiap frame (animasi lancar)
+        "-g 1",                   // keyframe tiap frame (animasi lancar)
         "-pix_fmt yuv420p",       // kompatibilitas maksimal
         "-an"                     // hapus audio
       ])
