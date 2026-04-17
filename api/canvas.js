@@ -126,7 +126,7 @@ async function convertToWebP1(url, quality = 80) {
     ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
       // 🔽 Tambahkan filter scale untuk stretch ke 512x512
-      //.videoFilter("scale=512:512") 
+      .videoFilter("scale=512:512") 
       .outputOptions([
         "-c:v libwebp",
         `-quality ${quality}`,
@@ -153,13 +153,13 @@ async function convertToWebP(url, quality = 80) {
 
     ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      //.videoFilter("scale=512:512") // stretch tetap dipertahankan
+      .videoFilter("scale=512:512") // stretch tetap dipertahankan
       .outputOptions([
         "-c:v libwebp_anim",      // gunakan encoder animasi
         `-quality ${quality}`,
         "-loop 0",                // looping tak terbatas
         "-vsync 0",               // pertahankan timing asli
-        "-g 1",                   // keyframe tiap frame (animasi lancar)
+        //"-g 1",                   // keyframe tiap frame (animasi lancar)
         "-pix_fmt yuv420p",       // kompatibilitas maksimal
         "-an"                     // hapus audio
       ])
