@@ -153,7 +153,7 @@ async function convertToWebP(url, quality = 80) {
 
     ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      .videoFilter("scale=512:512") // stretch tetap dipertahankan
+      //.videoFilter("scale=512:512") // stretch tetap dipertahankan
       .outputOptions([
         "-c:v libwebp_anim",      // gunakan encoder animasi
         `-quality ${quality}`,
