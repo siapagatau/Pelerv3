@@ -11,6 +11,8 @@ const ffmpegPath = require("ffmpeg-static");
 const axios = require("axios");
 const { PassThrough } = require("stream");
 const path = require("path");
+const fs = require("fs");
+const os = require("os");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 Font.loadDefault();
@@ -77,22 +79,19 @@ function setCorsHeaders(res) {
  * @param {number} opts.width   - lebar output px (0 = gunakan 512x512 default)
  * @returns {Promise<Buffer>}
  */
-function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
-  const outputStream = new PassThrough();
-  const chunks = [];
+function _runConvertToWebP(inputBuffer, { quality, fps = 0, width = 0 }) {
+  // Tulis buffer ke tmp file agar FFmpeg bisa baca WebP animated dengan benar
+  const tmpIn  = path.join(os.tmpdir(), `conv_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
+  const tmpOut = path.join(os.tmpdir(), `conv_out_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
+  fs.writeFileSync(tmpIn, inputBuffer);
 
   const filters = [];
   if (fps > 0)   filters.push(`fps=${fps}`);
-  // Jaga aspect ratio: width:-2 (tinggi otomatis, harus genap)
   if (width > 0) filters.push(`scale=${width}:-2:flags=lanczos`);
   else           filters.push("scale=512:512");
 
   return new Promise((resolve, reject) => {
-    outputStream.on("data",  (chunk) => chunks.push(chunk));
-    outputStream.on("end",   () => resolve(Buffer.concat(chunks)));
-    outputStream.on("error", reject);
-
-    ffmpeg(inputStream)
+    ffmpeg(tmpIn)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
       .videoFilter(filters.join(","))
       .outputOptions([
@@ -105,8 +104,23 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
         "-an",
       ])
       .format("webp")
-      .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
-      .pipe(outputStream, { end: true });
+      .on("error", (err) => {
+        fs.rmSync(tmpIn,  { force: true });
+        fs.rmSync(tmpOut, { force: true });
+        reject(new Error(`FFmpeg error: ${err.message}`));
+      })
+      .on("end", () => {
+        try {
+          const buf = fs.readFileSync(tmpOut);
+          resolve(buf);
+        } catch (e) {
+          reject(new Error(`Gagal baca output tmp: ${e.message}`));
+        } finally {
+          fs.rmSync(tmpIn,  { force: true });
+          fs.rmSync(tmpOut, { force: true });
+        }
+      })
+      .save(tmpOut);
   });
 }
 
@@ -132,20 +146,18 @@ async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
 
   console.log(`[convert] Original: ${(originalBuffer.length / 1024 / 1024).toFixed(2)}MB type=${originalType}`);
 
-  // Helper: buat readable stream dari buffer (bisa dipakai ulang)
-  function bufferToStream(buf) {
-    const s = new PassThrough();
-    s.end(buf);
-    return s;
-  }
-
   // Coba dari fps asli (0), lalu turunkan bertahap sampai muat
   for (const fps of [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1]) {
     try {
-      const buf = await _runConvertToWebP(bufferToStream(originalBuffer), { quality, fps, width: 0 });
+      const buf = await _runConvertToWebP(originalBuffer, { quality, fps, width: 0 });
       const mb  = (buf.length / 1024 / 1024).toFixed(2);
       console.log(`[convert] q=${quality} fps=${fps} → ${mb}MB`);
-      if (buf.length <= maxSize) return { buffer: buf, contentType: "image/webp", isOriginal: false };
+      if (buf.length > 0 && buf.length <= maxSize)
+        return { buffer: buf, contentType: "image/webp", isOriginal: false };
+      if (buf.length === 0) {
+        console.warn(`[convert] FFmpeg output kosong fps=${fps} → fallback ke buffer asli`);
+        return { buffer: originalBuffer, contentType: originalType, isOriginal: true };
+      }
     } catch (err) {
       console.warn(`[convert] FFmpeg gagal fps=${fps}: ${err.message} → fallback ke buffer asli`);
       return { buffer: originalBuffer, contentType: originalType, isOriginal: true };
