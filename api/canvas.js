@@ -117,7 +117,7 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
  *   Tahap 1 – turunkan FPS saja : 0 (asli) → 24 → 20 → 15 → 12 → 10 → 8 → 6 → 5 → 3 → 2 → 1
  *
  * Loop berhenti segera saat buffer ≤ maxSize.
- * Jika semua opsi habis → kembalikan buffer ASLI (tidak dikonversi).
+ * Jika FFmpeg gagal atau semua opsi habis → kembalikan buffer ASLI (tidak dikonversi).
  *
  * @param {string} url
  * @param {number} quality  - kualitas awal (0–100), default 80
@@ -125,23 +125,31 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
  * @returns {Promise<{ buffer: Buffer, contentType: string, isOriginal: boolean }>}
  */
 async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
-  // Download buffer asli sekali di awal sebagai fallback
+  // Download buffer asli SEKALI sebagai sumber + fallback
   const originalResponse = await axios({ method: "GET", url, responseType: "arraybuffer" });
   const originalBuffer   = Buffer.from(originalResponse.data);
   const originalType     = originalResponse.headers["content-type"] || "application/octet-stream";
 
-  async function attempt(fps) {
-    const { data } = await axios({ method: "GET", url, responseType: "stream" });
-    const buf = await _runConvertToWebP(data, { quality, fps, width: 0 });
-    const mb = (buf.length / 1024 / 1024).toFixed(2);
-    console.log(`[convert] q=${quality} fps=${fps} → ${mb}MB`);
-    return buf;
+  console.log(`[convert] Original: ${(originalBuffer.length / 1024 / 1024).toFixed(2)}MB type=${originalType}`);
+
+  // Helper: buat readable stream dari buffer (bisa dipakai ulang)
+  function bufferToStream(buf) {
+    const s = new PassThrough();
+    s.end(buf);
+    return s;
   }
 
   // Coba dari fps asli (0), lalu turunkan bertahap sampai muat
   for (const fps of [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1]) {
-    const buf = await attempt(fps);
-    if (buf.length <= maxSize) return { buffer: buf, contentType: "image/webp", isOriginal: false };
+    try {
+      const buf = await _runConvertToWebP(bufferToStream(originalBuffer), { quality, fps, width: 0 });
+      const mb  = (buf.length / 1024 / 1024).toFixed(2);
+      console.log(`[convert] q=${quality} fps=${fps} → ${mb}MB`);
+      if (buf.length <= maxSize) return { buffer: buf, contentType: "image/webp", isOriginal: false };
+    } catch (err) {
+      console.warn(`[convert] FFmpeg gagal fps=${fps}: ${err.message} → fallback ke buffer asli`);
+      return { buffer: originalBuffer, contentType: originalType, isOriginal: true };
+    }
   }
 
   // Semua opsi habis → kembalikan buffer asli tanpa konversi
