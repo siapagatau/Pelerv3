@@ -74,7 +74,7 @@ function setCorsHeaders(res) {
  * @param {object} opts
  * @param {number} opts.quality - 0–100
  * @param {number} opts.fps     - frame per second (0 = ikuti asli)
- * @param {number} opts.width   - lebar output px (0 = gunakan 512x512 default)
+ * @param {number} opts.width   - lebar output px (0 = jangan ubah resolusi)
  * @returns {Promise<Buffer>}
  */
 function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
@@ -82,19 +82,22 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
   const chunks = [];
 
   const filters = [];
-  if (fps > 0)   filters.push(`fps=${fps}`);
-  // Jaga aspect ratio: width:-2 (tinggi otomatis, harus genap)
+  if (fps > 0) filters.push(`fps=${fps}`);
+  // Hanya tambahkan filter scale jika width > 0 (jaga aspect ratio)
   if (width > 0) filters.push(`scale=${width}:-2:flags=lanczos`);
-  else           filters.push("scale=512:512");
 
   return new Promise((resolve, reject) => {
     outputStream.on("data",  (chunk) => chunks.push(chunk));
     outputStream.on("end",   () => resolve(Buffer.concat(chunks)));
     outputStream.on("error", reject);
 
-    ffmpeg(inputStream)
-      .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      .videoFilter(filters.join(","))
+    let command = ffmpeg(inputStream)
+      .inputOptions([
+        "-analyzeduration 10M",
+        "-probesize 10M",
+        // Force input format untuk WebP pipe (mencegah salah deteksi)
+        "-f", "webp_pipe"
+      ])
       .outputOptions([
         "-c:v libwebp_anim",
         `-quality ${quality}`,
@@ -103,24 +106,21 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
         "-g 1",
         "-pix_fmt yuv420p",
         "-an",
+        "-allow_mixed",    // dukungan untuk frame campuran (lossy/lossless)
       ])
-      .format("webp")
-      .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
+      .format("webp");
+
+    if (filters.length > 0) {
+      command = command.videoFilter(filters.join(","));
+    }
+
+    command.on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
       .pipe(outputStream, { end: true });
   });
 }
 
 /**
  * Konversi URL → animated WebP, auto-kecilkan jika hasil > maxSize (default 1MB).
- *
- * Urutan strategi (ringan → agresif):
- *   Tahap 1 – turunkan FPS saja      : 20 → 15 → 10 → 8 → 5
- *   Tahap 2 – turunkan resolusi saja  : 384 → 320 → 256 → 192 → 128
- *   Tahap 3 – kombinasi fps+resolusi  : fps=[10,8,5] × width=[256,192,128]
- *   Tahap 4 – turunkan quality        : 60 → 40 → 20 (masing-masing + fps 5 + width 128)
- *
- * Loop berhenti segera saat buffer ≤ maxSize.
- * Jika semua opsi habis → kembalikan buffer terkecil.
  *
  * @param {string} url
  * @param {number} quality  - kualitas awal (0–100), default 80
@@ -129,69 +129,70 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
 async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
   let smallest = null;
 
-  async function attempt(fps) {
+  async function attempt(fps, width = 0) {
     const { data } = await axios({ method: "GET", url, responseType: "stream" });
-    const buf = await _runConvertToWebP(data, { quality, fps, width: 0 });
+    const buf = await _runConvertToWebP(data, { quality, fps, width });
     if (!smallest || buf.length < smallest.length) smallest = buf;
     const mb = (buf.length / 1024 / 1024).toFixed(2);
-    console.log(`[convert] q=${quality} fps=${fps} → ${mb}MB`);
+    console.log(`[convert] q=${quality} fps=${fps} w=${width || 'auto'} → ${mb}MB`);
     return buf;
   }
 
-  // Coba dari fps asli (0), lalu turunkan bertahap sampai muat
+  // Coba dari fps asli (0), lalu turunkan bertahap tanpa ubah resolusi
   for (const fps of [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1]) {
-    const buf = await attempt(fps);
+    const buf = await attempt(fps, 0);
     if (buf.length <= maxSize) return buf;
   }
 
-  // Semua fps sudah dicoba, kembalikan yang terkecil
-  console.warn(
-    `[convert] ⚠️ Semua opsi fps habis. Terkecil: ${(smallest.length / 1024 / 1024).toFixed(2)}MB` +
-    ` (limit: ${(maxSize / 1024 / 1024).toFixed(2)}MB)`
-  );
+  // Jika masih kegedean, turunkan resolusi (dimulai dari 512, 384, ...)
+  for (const width of [512, 384, 256, 192, 128, 96]) {
+    const buf = await attempt(10, width); // fps 10 sebagai kompromi
+    if (buf.length <= maxSize) return buf;
+  }
+
+  // Terakhir, turunkan quality
+  for (const q of [60, 40, 20]) {
+    const buf = await attempt(8, 128);
+    if (buf.length <= maxSize) return buf;
+  }
+
+  console.warn(`[convert] ⚠️ Semua opsi habis. Terkecil: ${(smallest.length / 1024 / 1024).toFixed(2)}MB (limit: ${(maxSize / 1024 / 1024).toFixed(2)}MB)`);
   return smallest;
 }
 
 /**
- * Kompres gambar ke JPEG/WebP max 100KB tanpa stretch.
- * Aspect ratio dipertahankan, resolusi diturunkan jika perlu.
+ * Kompres gambar ke WebP max 100KB tanpa stretch.
  * @param {string} url     - URL gambar
  * @param {number} maxSize - Batas ukuran dalam bytes (default: 100KB)
  * @returns {Promise<Buffer>}
  */
 async function compressImage(url, maxSize = 100 * 1024) {
-  const response = await axios({ method: "GET", url, responseType: "stream" });
-
-  // Tahap 1: coba quality tinggi dulu, turunkan bertahap sampai muat
-  const qualities = [80, 65, 50, 35, 20];
-
-  for (const quality of qualities) {
-    const result = await _runCompress(response.data.pipe(new PassThrough()), quality);
-    if (result.length <= maxSize) return result;
-
-    // response.data sudah dipakai, harus fetch ulang untuk iterasi berikutnya
-    if (quality !== qualities[qualities.length - 1]) {
-      const retry = await axios({ method: "GET", url, responseType: "stream" });
-      response.data = retry.data;
-    }
+  // Helper untuk menjalankan kompres dengan parameter tertentu
+  async function runCompressWithParams(quality, scale = null) {
+    const response = await axios({ method: "GET", url, responseType: "stream" });
+    return _runCompress(response.data, quality, scale);
   }
 
-  // Tahap 2: jika masih > maxSize setelah quality terkecil,
-  // turunkan resolusi (scale down) sambil tetap jaga aspect ratio
+  // Tahap 1: turunkan quality
+  const qualities = [80, 65, 50, 35, 20];
+  for (const quality of qualities) {
+    const result = await runCompressWithParams(quality);
+    if (result.length <= maxSize) return result;
+  }
+
+  // Tahap 2: turunkan resolusi
   const scales = [0.75, 0.5, 0.35, 0.25];
   for (const scale of scales) {
-    const retry = await axios({ method: "GET", url, responseType: "stream" });
-    const result = await _runCompress(retry.data, 20, scale);
+    const result = await runCompressWithParams(20, scale);
     if (result.length <= maxSize) return result;
   }
 
-  // Kembalikan hasil terkecil yang bisa dihasilkan (scale 0.25 + quality 20)
-  const last = await axios({ method: "GET", url, responseType: "stream" });
-  return _runCompress(last.data, 20, 0.25);
+  // Kembalikan hasil terkecil
+  return runCompressWithParams(20, 0.25);
 }
 
 /**
- * Internal: jalankan satu kali ffmpeg compress
+ * Internal: jalankan satu kali ffmpeg compress (ambil 1 frame)
  * @param {Stream} inputStream
  * @param {number} quality   - 0-100
  * @param {number|null} scale - misal 0.5 = setengah resolusi asli, null = tidak resize
@@ -200,10 +201,9 @@ function _runCompress(inputStream, quality, scale = null) {
   const outputStream = new PassThrough();
   const chunks = [];
 
-  // scale=iw*{scale}:ih*{scale} → proportional, tidak stretch
   const scaleFilter = scale
     ? `scale=iw*${scale}:ih*${scale}:flags=lanczos`
-    : "scale=iw:ih:flags=lanczos"; // no-op tapi tetap jaga pixel format
+    : "scale=iw:ih:flags=lanczos"; // no-op
 
   return new Promise((resolve, reject) => {
     outputStream.on("data", (chunk) => chunks.push(chunk));
@@ -214,12 +214,12 @@ function _runCompress(inputStream, quality, scale = null) {
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
       .videoFilter(scaleFilter)
       .outputOptions([
-        "-c:v libwebp",   // WebP lebih efisien dari JPEG untuk ukuran kecil
+        "-c:v libwebp",
         `-quality ${quality}`,
         "-loop 0",
         "-preset picture",
         "-an",
-        "-vframes 1",     // ambil 1 frame saja (untuk GIF/video → ambil frame pertama)
+        "-vframes 1",
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg compress error: ${err.message}`)))
@@ -251,7 +251,6 @@ module.exports = async (req, res) => {
     if (q < 0 || q > 100)
       return res.status(400).json({ error: "Quality harus antara 0-100." });
 
-    // maxsize opsional (bytes), default 1MB
     const maxBytes = parseInt(maxsize) || 1 * 1024 * 1024;
     if (maxBytes < 1024 || maxBytes > 50 * 1024 * 1024)
       return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 52428800 (50MB)." });
@@ -281,7 +280,6 @@ module.exports = async (req, res) => {
       return res.status(400).json({ error: "URL tidak valid." });
     }
 
-    // maxsize opsional (bytes), default 100KB
     const maxBytes = parseInt(maxsize) || 100 * 1024;
     if (maxBytes < 1024 || maxBytes > 10 * 1024 * 1024)
       return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 10485760 (10MB)." });
