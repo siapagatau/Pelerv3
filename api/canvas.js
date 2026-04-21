@@ -68,11 +68,29 @@ function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-async function convertToWebP(url, quality = 80) {
-  const response = await axios({ method: "GET", url, responseType: "stream" });
-  const inputStream = response.data;
+/**
+ * Jalankan satu kali konversi WebP animated dengan opsi tertentu.
+ * @param {Stream} inputStream
+ * @param {number} quality  - 0–100
+ * @param {number} fps      - frame per second (0 = ikuti asli)
+ * @param {number} scale    - lebar output dalam piksel (0 = ikuti asli)
+ * @returns {Promise<Buffer>}
+ */
+function _runConvertToWebP(inputStream, quality, fps = 0, scale = 0) {
   const outputStream = new PassThrough();
   const chunks = [];
+
+  // Bangun video filter: scale dan/atau fps
+  const filters = [];
+  if (fps > 0) filters.push(`fps=${fps}`);
+  if (scale > 0) {
+    // Jaga aspect ratio: lebar = scale, tinggi menyesuaikan (harus genap)
+    filters.push(`scale=${scale}:-2:flags=lanczos`);
+  } else {
+    // Tetap jaga scale 512 seperti semula jika tidak ada override
+    filters.push("scale=512:512");
+  }
+  const vf = filters.join(",");
 
   return new Promise((resolve, reject) => {
     outputStream.on("data", (chunk) => chunks.push(chunk));
@@ -81,7 +99,7 @@ async function convertToWebP(url, quality = 80) {
 
     ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
-      .videoFilter("scale=512:512")
+      .videoFilter(vf)
       .outputOptions([
         "-c:v libwebp_anim",
         `-quality ${quality}`,
@@ -95,6 +113,55 @@ async function convertToWebP(url, quality = 80) {
       .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
       .pipe(outputStream, { end: true });
   });
+}
+
+/**
+ * Konversi URL ke animated WebP.
+ * Jika hasil > maxSize (default 2MB), otomatis coba turunkan FPS lalu resolusi
+ * sampai ukuran muat atau opsi habis (kembalikan hasil terkecil).
+ *
+ * @param {string} url
+ * @param {number} quality  - kualitas awal (0–100)
+ * @param {number} maxSize  - batas ukuran bytes (default 2MB)
+ * @returns {Promise<Buffer>}
+ */
+async function convertToWebP(url, quality = 80, maxSize = 2 * 1024 * 1024) {
+  /**
+   * Strategi pengurangan ukuran (diterapkan berurutan):
+   * 1. Turunkan FPS: 24 → 15 → 10 → 8
+   * 2. Turunkan resolusi: 512 → 384 → 256 → 192 → 128
+   * 3. Turunkan quality: 80 → 60 → 40 → 20
+   * Setiap kombinasi dicoba sampai ukuran ≤ maxSize.
+   */
+  const fpsOptions   = [0, 24, 15, 10, 8];       // 0 = ikuti asli (default)
+  const scaleOptions = [0, 384, 256, 192, 128];   // 0 = 512x512 (default)
+  const qualitySteps = [quality, 60, 40, 20];
+
+  let smallestBuffer = null;
+
+  for (const q of qualitySteps) {
+    for (const fps of fpsOptions) {
+      for (const scale of scaleOptions) {
+        const stream = await axios({ method: "GET", url, responseType: "stream" });
+        const buf = await _runConvertToWebP(stream.data, q, fps, scale);
+
+        // Simpan kandidat terkecil sejauh ini
+        if (!smallestBuffer || buf.length < smallestBuffer.length) {
+          smallestBuffer = buf;
+        }
+
+        if (buf.length <= maxSize) {
+          return buf; // ✅ Sudah muat, langsung kembalikan
+        }
+      }
+    }
+  }
+
+  // Semua opsi habis → kembalikan hasil terkecil yang bisa dihasilkan
+  console.warn(
+    `[convertToWebP] Semua opsi habis. Ukuran terkecil: ${(smallestBuffer.length / 1024 / 1024).toFixed(2)}MB (limit: ${(maxSize / 1024 / 1024).toFixed(2)}MB)`
+  );
+  return smallestBuffer;
 }
 
 /**
@@ -121,7 +188,7 @@ async function compressImage(url, maxSize = 100 * 1024) {
     }
   }
 
-  // Tahap 2: jika masih > 100KB setelah quality terkecil,
+  // Tahap 2: jika masih > maxSize setelah quality terkecil,
   // turunkan resolusi (scale down) sambil tetap jaga aspect ratio
   const scales = [0.75, 0.5, 0.35, 0.25];
   for (const scale of scales) {
@@ -185,7 +252,7 @@ module.exports = async (req, res) => {
     if (req.method !== "GET")
       return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
 
-    const { url, quality } = req.query;
+    const { url, quality, maxsize } = req.query;
     if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
 
     try { new URL(url); } catch {
@@ -196,10 +263,17 @@ module.exports = async (req, res) => {
     if (q < 0 || q > 100)
       return res.status(400).json({ error: "Quality harus antara 0-100." });
 
+    // maxsize opsional (bytes), default 2MB
+    const maxBytes = parseInt(maxsize) || 2 * 1024 * 1024;
+    if (maxBytes < 1024 || maxBytes > 50 * 1024 * 1024)
+      return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 52428800 (50MB)." });
+
     try {
-      const webpBuffer = await convertToWebP(url, q);
+      const webpBuffer = await convertToWebP(url, q, maxBytes);
       res.setHeader("Content-Type", "image/webp");
+      res.setHeader("Content-Length", webpBuffer.length);
       res.setHeader("Cache-Control", "public, max-age=3600");
+      res.setHeader("X-Output-Size", `${(webpBuffer.length / 1024 / 1024).toFixed(2)}MB`);
       return res.send(webpBuffer);
     } catch (err) {
       console.error(err);
