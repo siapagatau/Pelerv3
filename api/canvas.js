@@ -10,6 +10,7 @@ const ffmpeg = require("fluent-ffmpeg");
 const ffmpegPath = require("ffmpeg-static");
 const axios = require("axios");
 const { PassThrough } = require("stream");
+const path = require("path");
 
 ffmpeg.setFfmpegPath(ffmpegPath);
 Font.loadDefault();
@@ -68,177 +69,152 @@ function setCorsHeaders(res) {
 }
 
 /**
- * Konversi stream ke WebP dengan prioritas animated (bergerak)
- * @param {Stream} inputStream
- * @param {object} opts
- * @param {number} opts.quality - 0–100
- * @param {number} opts.fps     - frame per second (0 = ikuti asli)
- * @param {number} opts.width   - lebar output px (0 = gunakan 512)
- * @returns {Promise<Buffer>}
+ * Membuat placeholder WebP hitam ukuran 512x512 sebagai fallback
  */
-async function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
-  const targetWidth = width > 0 ? width : 512;
-  
-  // Helper untuk menjalankan ffmpeg dengan encoder dan opsi tertentu
-  const runEncoder = (encoder, extraOptions = [], inputOptions = [], filterChain = null) => {
-    return new Promise((resolve, reject) => {
-      const outStream = new PassThrough();
-      const chunks = [];
-      outStream.on("data", chunk => chunks.push(chunk));
-      outStream.on("end", () => resolve(Buffer.concat(chunks)));
-      outStream.on("error", reject);
+async function createPlaceholderWebP() {
+  const outputStream = new PassThrough();
+  const chunks = [];
 
-      // Bangun filter jika tidak diberikan
-      let finalFilter = filterChain;
-      if (!finalFilter) {
-        const filters = [];
-        if (fps > 0) filters.push(`fps=${fps}`);
-        filters.push(`scale=${targetWidth}:-2:flags=lanczos`);
-        finalFilter = filters.join(",");
-      }
+  return new Promise((resolve, reject) => {
+    outputStream.on("data", (chunk) => chunks.push(chunk));
+    outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outputStream.on("error", reject);
 
-      let command = ffmpeg(inputStream)
-        .inputOptions([
-          "-analyzeduration 10M",
-          "-probesize 10M",
-          ...inputOptions
-        ])
-        .videoFilter(finalFilter)
-        .outputOptions([
-          `-c:v ${encoder}`,
-          `-quality ${quality}`,
-          "-loop 0",
-          "-vsync 1",          // sinkronisasi frame lebih baik
-          "-pix_fmt yuv420p",
-          "-an",
-          ...extraOptions
-        ])
-        .format("webp");
-
-      if (encoder === "libwebp_anim") {
-        command = command.outputOptions(["-g 1"]); // keyframe setiap frame
-      }
-
-      command.on("error", reject).pipe(outStream, { end: true });
-    });
-  };
-
-  // Validasi header WebP
-  const isValidWebP = (buf) => {
-    return buf.length > 20 &&
-           buf.toString("utf8", 0, 4) === "RIFF" &&
-           buf.toString("utf8", 8, 12) === "WEBP";
-  };
-
-  // --- Strategi 1: coba animated dengan repair timestamp ---
-  try {
-    const result = await runEncoder("libwebp_anim", [], ["-fflags", "+genpts+igndts"]);
-    if (isValidWebP(result)) return result;
-    throw new Error("Header WebP tidak valid");
-  } catch (err) {
-    console.warn(`[convert] libwebp_anim dengan repair gagal: ${err.message}`);
-  }
-
-  // --- Strategi 2: coba animated dengan FPS rendah (5) ---
-  if (fps === 0 || fps > 5) {
-    try {
-      const lowFpsFilters = [`fps=5`, `scale=${targetWidth}:-2:flags=lanczos`].join(",");
-      const resultLow = await runEncoder("libwebp_anim", [], ["-fflags", "+genpts+igndts"], lowFpsFilters);
-      if (isValidWebP(resultLow)) {
-        console.log(`[convert] Berhasil dengan fps=5 (animated)`);
-        return resultLow;
-      }
-    } catch (err) {
-      console.warn(`[convert] libwebp_anim fps=5 gagal: ${err.message}`);
-    }
-  }
-
-  // --- Strategi 3: coba animated dengan FPS sangat rendah (3) ---
-  try {
-    const veryLowFpsFilters = [`fps=3`, `scale=${targetWidth}:-2:flags=lanczos`].join(",");
-    const resultVeryLow = await runEncoder("libwebp_anim", [], ["-fflags", "+genpts+igndts"], veryLowFpsFilters);
-    if (isValidWebP(resultVeryLow)) {
-      console.log(`[convert] Berhasil dengan fps=3 (animated)`);
-      return resultVeryLow;
-    }
-  } catch (err) {
-    console.warn(`[convert] libwebp_anim fps=3 gagal: ${err.message}`);
-  }
-
-  // --- Strategi 4: coba animated dengan fps=1 (paling lambat, tapi tetap animasi) ---
-  try {
-    const fps1Filters = [`fps=1`, `scale=${targetWidth}:-2:flags=lanczos`].join(",");
-    const resultFps1 = await runEncoder("libwebp_anim", [], ["-fflags", "+genpts+igndts"], fps1Filters);
-    if (isValidWebP(resultFps1)) {
-      console.log(`[convert] Berhasil dengan fps=1 (animated, sangat lambat)`);
-      return resultFps1;
-    }
-  } catch (err) {
-    console.warn(`[convert] libwebp_anim fps=1 gagal: ${err.message}`);
-  }
-
-  // --- Terakhir: fallback ke static (1 frame) ---
-  console.warn(`[convert] Semua upaya animated gagal, fallback ke static.`);
-  return await runEncoder("libwebp", ["-vframes 1"]);
+    ffmpeg()
+      .input("color=c=black:s=512x512:d=0.1")
+      .inputOptions(["-f lavfi", "-t 0.1"])
+      .videoFilter("fps=1")
+      .outputOptions([
+        "-c:v libwebp",
+        "-quality 80",
+        "-loop 0",
+        "-pix_fmt yuv420p",
+        "-frames:v 1",
+      ])
+      .format("webp")
+      .on("error", (err) => reject(new Error(`Placeholder FFmpeg error: ${err.message}`)))
+      .pipe(outputStream, { end: true });
+  });
 }
 
 /**
- * Konversi URL ke WebP (animated jika input memiliki banyak frame, static jika benar-benar tidak bisa)
- * Otomatis mengecilkan ukuran hingga ≤ maxSize, namun tetap berusaha mempertahankan animasi
- * @param {string} url
- * @param {number} quality  - 0-100, default 80
- * @param {number} maxSize  - bytes, default 1MB
+ * Jalankan satu kali konversi WebP animated dengan opsi tertentu.
+ * Memaksa output persegi 1:1 (stretch) dengan toleransi error.
+ */
+function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
+  const outputStream = new PassThrough();
+  const chunks = [];
+
+  const targetSize = width > 0 ? width : 512;
+  const filters = [];
+  if (fps > 0) filters.push(`fps=${fps}`);
+  filters.push(`scale=${targetSize}:${targetSize}:flags=lanczos`); // stretch 1:1
+
+  return new Promise((resolve, reject) => {
+    outputStream.on("data", (chunk) => chunks.push(chunk));
+    outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outputStream.on("error", reject);
+
+    ffmpeg(inputStream)
+      .inputOptions([
+        "-analyzeduration 10M",
+        "-probesize 10M",
+        "-fflags +genpts+discardcorrupt",
+        "-err_detect ignore_err"
+      ])
+      .videoFilter(filters.join(","))
+      .outputOptions([
+        "-c:v libwebp_anim",
+        `-quality ${quality}`,
+        "-loop 0",
+        "-vsync 0",
+        "-g 1",
+        "-pix_fmt yuv420p",
+        "-an",
+      ])
+      .format("webp")
+      .on("error", (err) => reject(new Error(`FFmpeg error: ${err.message}`)))
+      .pipe(outputStream, { end: true });
+  });
+}
+
+/**
+ * Konversi URL → animated WebP, auto-kecilkan jika hasil > maxSize (default 1MB).
+ * Toleran terhadap corrupt input, akan mencoba berbagai fps.
+ * Jika semua gagal, mengembalikan placeholder hitam.
  */
 async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
   let smallest = null;
-  // Daftar fps yang dicoba: prioritaskan fps asli (0), lalu fps yang lebih rendah agar ukuran kecil
-  const candidateFpsList = [0, 15, 12, 10, 8, 6, 5, 4, 3, 2, 1];
 
   async function attempt(fps) {
-    const { data } = await axios({ method: "GET", url, responseType: "stream" });
-    const buf = await _runConvertToWebP(data, { quality, fps, width: 0 });
-    if (!smallest || buf.length < smallest.length) smallest = buf;
-    console.log(`[convert] q=${quality} fps=${fps === 0 ? "auto" : fps} → ${(buf.length / 1024 / 1024).toFixed(2)}MB`);
-    return buf;
+    try {
+      const { data } = await axios({
+        method: "GET",
+        url,
+        responseType: "stream",
+        timeout: 15000,
+      });
+      const buf = await _runConvertToWebP(data, { quality, fps, width: 0 });
+      if (!smallest || buf.length < smallest.length) smallest = buf;
+      const mb = (buf.length / 1024 / 1024).toFixed(2);
+      console.log(`[convert] q=${quality} fps=${fps} → ${mb}MB`);
+      return buf;
+    } catch (err) {
+      console.warn(`[convert] attempt fps=${fps} gagal: ${err.message}`);
+      return null;
+    }
   }
 
-  for (const fps of candidateFpsList) {
+  const fpsList = [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1];
+  for (const fps of fpsList) {
     const buf = await attempt(fps);
-    if (buf.length <= maxSize) return buf;
+    if (buf && buf.length <= maxSize) return buf;
   }
 
-  console.warn(`[convert] ⚠️ Semua opsi fps habis. Terkecil: ${(smallest.length / 1024 / 1024).toFixed(2)}MB (limit ${(maxSize / 1024 / 1024).toFixed(2)}MB)`);
-  return smallest;
+  if (smallest) {
+    console.warn(
+      `[convert] ⚠️ Tidak muat dalam ${(maxSize / 1024 / 1024).toFixed(2)}MB. ` +
+      `Terkecil: ${(smallest.length / 1024 / 1024).toFixed(2)}MB`
+    );
+    return smallest;
+  }
+
+  console.error("[convert] ❌ Semua percobaan gagal, mengembalikan placeholder.");
+  return await createPlaceholderWebP();
 }
 
 /**
- * Kompres gambar (static) ke WebP dengan target maxSize (default 100KB)
- * @param {string} url
- * @param {number} maxSize bytes
+ * Kompres gambar ke WebP max 100KB tanpa stretch.
+ * Aspect ratio dipertahankan, resolusi diturunkan jika perlu.
  */
 async function compressImage(url, maxSize = 100 * 1024) {
-  const getStream = () => axios({ method: "GET", url, responseType: "stream" }).then(r => r.data);
+  const response = await axios({ method: "GET", url, responseType: "stream" });
 
   const qualities = [80, 65, 50, 35, 20];
-  for (const q of qualities) {
-    const stream = await getStream();
-    const result = await _runCompress(stream, q);
+
+  for (const quality of qualities) {
+    const result = await _runCompress(response.data.pipe(new PassThrough()), quality);
     if (result.length <= maxSize) return result;
+
+    if (quality !== qualities[qualities.length - 1]) {
+      const retry = await axios({ method: "GET", url, responseType: "stream" });
+      response.data = retry.data;
+    }
   }
 
   const scales = [0.75, 0.5, 0.35, 0.25];
   for (const scale of scales) {
-    const stream = await getStream();
-    const result = await _runCompress(stream, 20, scale);
+    const retry = await axios({ method: "GET", url, responseType: "stream" });
+    const result = await _runCompress(retry.data, 20, scale);
     if (result.length <= maxSize) return result;
   }
 
-  const lastStream = await getStream();
-  return _runCompress(lastStream, 20, 0.25);
+  const last = await axios({ method: "GET", url, responseType: "stream" });
+  return _runCompress(last.data, 20, 0.25);
 }
 
 function _runCompress(inputStream, quality, scale = null) {
-  const outStream = new PassThrough();
+  const outputStream = new PassThrough();
   const chunks = [];
 
   const scaleFilter = scale
@@ -246,9 +222,9 @@ function _runCompress(inputStream, quality, scale = null) {
     : "scale=iw:ih:flags=lanczos";
 
   return new Promise((resolve, reject) => {
-    outStream.on("data", c => chunks.push(c));
-    outStream.on("end", () => resolve(Buffer.concat(chunks)));
-    outStream.on("error", reject);
+    outputStream.on("data", (chunk) => chunks.push(chunk));
+    outputStream.on("end", () => resolve(Buffer.concat(chunks)));
+    outputStream.on("error", reject);
 
     ffmpeg(inputStream)
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
@@ -259,36 +235,41 @@ function _runCompress(inputStream, quality, scale = null) {
         "-loop 0",
         "-preset picture",
         "-an",
-        "-vframes 1"
+        "-vframes 1",
       ])
       .format("webp")
-      .on("error", err => reject(new Error(`FFmpeg compress error: ${err.message}`)))
-      .pipe(outStream, { end: true });
+      .on("error", (err) => reject(new Error(`FFmpeg compress error: ${err.message}`)))
+      .pipe(outputStream, { end: true });
   });
 }
 
 // ---------- Handler Utama ----------
 module.exports = async (req, res) => {
   setCorsHeaders(res);
+
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const { type } = req.query;
 
-  // --- CONVERT (WebP animated / static) ---
+  // --- CONVERT ---
   if (type === "convert") {
     if (req.method !== "GET")
       return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
 
     const { url, quality, maxsize } = req.query;
     if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-    try { new URL(url); } catch { return res.status(400).json({ error: "URL tidak valid." }); }
+
+    try { new URL(url); } catch {
+      return res.status(400).json({ error: "URL tidak valid." });
+    }
 
     const q = parseInt(quality) || 80;
-    if (q < 0 || q > 100) return res.status(400).json({ error: "Quality harus antara 0-100." });
+    if (q < 0 || q > 100)
+      return res.status(400).json({ error: "Quality harus antara 0-100." });
 
     const maxBytes = parseInt(maxsize) || 1 * 1024 * 1024;
     if (maxBytes < 1024 || maxBytes > 50 * 1024 * 1024)
-      return res.status(400).json({ error: "maxsize harus antara 1KB hingga 50MB." });
+      return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 52428800 (50MB)." });
 
     try {
       const webpBuffer = await convertToWebP(url, q, maxBytes);
@@ -303,18 +284,21 @@ module.exports = async (req, res) => {
     }
   }
 
-  // --- COMPRESS (static WebP) ---
+  // --- COMPRESS ---
   if (type === "compress") {
     if (req.method !== "GET")
       return res.status(405).json({ error: "Compress hanya mendukung metode GET." });
 
     const { url, maxsize } = req.query;
     if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-    try { new URL(url); } catch { return res.status(400).json({ error: "URL tidak valid." }); }
+
+    try { new URL(url); } catch {
+      return res.status(400).json({ error: "URL tidak valid." });
+    }
 
     const maxBytes = parseInt(maxsize) || 100 * 1024;
     if (maxBytes < 1024 || maxBytes > 10 * 1024 * 1024)
-      return res.status(400).json({ error: "maxsize harus antara 1KB hingga 10MB." });
+      return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 10485760 (10MB)." });
 
     try {
       const compressed = await compressImage(url, maxBytes);
@@ -333,20 +317,25 @@ module.exports = async (req, res) => {
   if (type === "leaderboard") {
     if (req.method !== "POST")
       return res.status(405).json({ error: "Leaderboard requires POST method." });
+
     try {
       const { header, players, background, variant } = req.body;
       if (!players || !Array.isArray(players))
         return res.status(400).json({ error: "Missing players array." });
+
       const safeHeader = {
         title:    header?.title    || "Leaderboard",
         image:    header?.image    || "https://github.com/neplextech.png",
         subtitle: header?.subtitle || "0 members",
       };
+
       const lb = new LeaderboardBuilder()
         .setHeader(safeHeader)
         .setPlayers(players.slice(0, 10));
+
       if (background) lb.setBackground(background);
       lb.setVariant(variant === "horizontal" ? "horizontal" : "default");
+
       const imageBuffer = await lb.build({ format: "png" });
       res.setHeader("Content-Type", "image/png");
       res.setHeader("Cache-Control", "public, max-age=60");
@@ -360,11 +349,13 @@ module.exports = async (req, res) => {
   // --- RANK / WELCOME / GOODBYE ---
   if (req.method !== "GET")
     return res.status(405).json({ error: "Method not allowed." });
+
   if (!type)
     return res.status(400).json({ error: "Missing 'type' parameter." });
 
   try {
     let imageBuffer;
+
     if (type === "rank") {
       const { username, displayName, avatar, currentXP, requiredXP, level, rank, status, background } = req.query;
       const card = new RankCardBuilder()
@@ -379,7 +370,8 @@ module.exports = async (req, res) => {
       if (status && ["online", "idle", "dnd", "offline"].includes(status)) card.setStatus(status);
       card.setBackground(background || "#2C2F33");
       imageBuffer = await card.build({ format: "png" });
-    } else if (type === "welcome" || type === "goodbye") {
+    }
+    else if (type === "welcome" || type === "goodbye") {
       const { displayName, avatar, message } = req.query;
       const card = new GreetingsCard()
         .setType(type)
@@ -387,9 +379,11 @@ module.exports = async (req, res) => {
         .setAvatar(avatar || "https://cdn.discordapp.com/embed/avatars/0.png")
         .setMessage(message || (type === "welcome" ? "Welcome to the server!" : "We'll miss you!"));
       imageBuffer = await card.build({ format: "png" });
-    } else {
+    }
+    else {
       return res.status(400).json({ error: "Invalid type. Use 'welcome', 'goodbye', 'rank', 'leaderboard', 'convert', atau 'compress'." });
     }
+
     res.setHeader("Content-Type", "image/png");
     res.setHeader("Cache-Control", "public, max-age=60");
     res.send(imageBuffer);
