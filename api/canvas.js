@@ -69,46 +69,6 @@ function setCorsHeaders(res) {
 }
 
 /**
- * Probe video menggunakan ffprobe untuk mendapatkan metadata (terutama FPS)
- * @param {string} url
- * @returns {Promise<object>}
- */
-function probeVideo(url) {
-  return new Promise((resolve, reject) => {
-    axios({ method: "GET", url, responseType: "stream" })
-      .then(response => {
-        const stream = response.data;
-        ffmpeg.ffprobe(stream, (err, metadata) => {
-          if (err) reject(err);
-          else resolve(metadata);
-        });
-      })
-      .catch(reject);
-  });
-}
-
-/**
- * Mendapatkan FPS rata-rata dari video URL
- * @param {string} url
- * @returns {Promise<number|null>}
- */
-async function getVideoFps(url) {
-  try {
-    const metadata = await probeVideo(url);
-    const videoStream = metadata.streams.find(s => s.codec_type === "video");
-    if (!videoStream) return null;
-    const fpsFraction = videoStream.r_frame_rate;
-    if (!fpsFraction) return null;
-    const [num, den] = fpsFraction.split("/").map(Number);
-    const fps = num / den;
-    return fps;
-  } catch (err) {
-    console.warn("[getVideoFps] Gagal membaca FPS:", err.message);
-    return null;
-  }
-}
-
-/**
  * Jalankan satu kali konversi WebP animated dengan opsi tertentu.
  * @param {Stream} inputStream
  * @param {object} opts
@@ -153,8 +113,14 @@ function _runConvertToWebP(inputStream, { quality, fps = 0, width = 0 }) {
 /**
  * Konversi URL → animated WebP, auto-kecilkan jika hasil > maxSize (default 1MB).
  *
- * PERBAIKAN: Jika FPS asli video ≤ 10, maka hanya mencoba fps=0 (tidak mengecilkan fps)
- * untuk menghindari kualitas visual yang terlalu buruk.
+ * Urutan strategi (ringan → agresif):
+ *   Tahap 1 – turunkan FPS saja      : 20 → 15 → 10 → 8 → 5
+ *   Tahap 2 – turunkan resolusi saja  : 384 → 320 → 256 → 192 → 128
+ *   Tahap 3 – kombinasi fps+resolusi  : fps=[10,8,5] × width=[256,192,128]
+ *   Tahap 4 – turunkan quality        : 60 → 40 → 20 (masing-masing + fps 5 + width 128)
+ *
+ * Loop berhenti segera saat buffer ≤ maxSize.
+ * Jika semua opsi habis → kembalikan buffer terkecil.
  *
  * @param {string} url
  * @param {number} quality  - kualitas awal (0–100), default 80
@@ -172,32 +138,13 @@ async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
     return buf;
   }
 
-  // Dapatkan FPS asli
-  let originalFps = await getVideoFps(url);
-  if (originalFps && originalFps > 0) {
-    console.log(`[convert] FPS asli video: ${originalFps.toFixed(2)}`);
-  } else {
-    console.log("[convert] Tidak bisa membaca FPS, gunakan urutan default");
-  }
-
-  // Tentukan daftar FPS yang akan dicoba
-  let fpsCandidates;
-  if (originalFps !== null && originalFps <= 10) {
-    // FPS asli sudah kecil (≤10) -> jangan turunkan lebih lanjut
-    console.log("[convert] FPS asli ≤ 10, tidak akan memperkecil FPS");
-    fpsCandidates = [0];
-  } else {
-    // Urutan menurun seperti sebelumnya (0 = ikuti asli, lalu turun)
-    fpsCandidates = [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1];
-  }
-
-  // Coba semua FPS dalam daftar
-  for (const fps of fpsCandidates) {
+  // Coba dari fps asli (0), lalu turunkan bertahap sampai muat
+  for (const fps of [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1]) {
     const buf = await attempt(fps);
     if (buf.length <= maxSize) return buf;
   }
 
-  // Jika masih belum muat, kembalikan buffer terkecil yang pernah dihasilkan
+  // Semua fps sudah dicoba, kembalikan yang terkecil
   console.warn(
     `[convert] ⚠️ Semua opsi fps habis. Terkecil: ${(smallest.length / 1024 / 1024).toFixed(2)}MB` +
     ` (limit: ${(maxSize / 1024 / 1024).toFixed(2)}MB)`
