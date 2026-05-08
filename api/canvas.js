@@ -248,6 +248,125 @@ function _runCompress(inputStream, quality, scale = null) {
   });
 }
 
+// ---------- Helper: Deteksi WebP Animated ----------
+/**
+ * Deteksi apakah sebuah WebP (URL atau buffer) bersifat animated.
+ * Menggunakan ffprobe untuk membaca jumlah frame.
+ * @param {string|Buffer} input - URL atau buffer data WebP
+ * @returns {Promise<boolean>}
+ */
+async function isWebPAnimated(input) {
+    return new Promise(async (resolve, reject) => {
+        try {
+            let inputPath = input;
+            let isTemp = false;
+            if (Buffer.isBuffer(input)) {
+                const tmpPath = path.join(os.tmpdir(), `webp_probe_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
+                fs.writeFileSync(tmpPath, input);
+                inputPath = tmpPath;
+                isTemp = true;
+            }
+
+            const ffprobe = require('fluent-ffmpeg').ffprobe;
+            ffprobe(inputPath, (err, metadata) => {
+                if (isTemp) fs.rmSync(inputPath, { force: true });
+                if (err) return reject(err);
+                // Video stream memiliki "nb_frames" > 1 untuk animasi WebP
+                const videoStream = metadata.streams.find(s => s.codec_type === 'video');
+                const frameCount = videoStream?.nb_frames ? parseInt(videoStream.nb_frames) : 0;
+                resolve(frameCount > 1);
+            });
+        } catch (err) {
+            reject(err);
+        }
+    });
+}
+
+/**
+ * Ekstrak frame pertama dari WebP (statis atau animasi) ke PNG/JPEG.
+ * @param {Buffer} webpBuffer - buffer WebP
+ * @param {string} format - 'png' atau 'jpeg'
+ * @param {number} quality - 0-100 (hanya untuk JPEG)
+ * @returns {Promise<Buffer>}
+ */
+async function extractWebPFrame(webpBuffer, format = 'png', quality = 80) {
+    const tmpIn = path.join(os.tmpdir(), `extract_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
+    const tmpOut = path.join(os.tmpdir(), `extract_out_${Date.now()}_${Math.random().toString(36).slice(2)}.${format}`);
+    fs.writeFileSync(tmpIn, webpBuffer);
+
+    return new Promise((resolve, reject) => {
+        let cmd = ffmpeg(tmpIn)
+            .inputOptions(['-analyzeduration 10M', '-probesize 10M'])
+            .outputOptions(['-vframes 1', '-an']);
+
+        if (format === 'jpeg') {
+            cmd = cmd.outputOptions([`-quality ${quality}`]).format('mjpeg');
+        } else {
+            cmd = cmd.format('png');
+        }
+
+        cmd.on('error', (err) => {
+            fs.rmSync(tmpIn, { force: true });
+            reject(new Error(`Extract frame error: ${err.message}`));
+        })
+        .on('end', () => {
+            try {
+                const buf = fs.readFileSync(tmpOut);
+                resolve(buf);
+            } catch (e) {
+                reject(e);
+            } finally {
+                fs.rmSync(tmpIn, { force: true });
+                fs.rmSync(tmpOut, { force: true });
+            }
+        })
+        .save(tmpOut);
+    });
+}
+
+/**
+ * Konversi WebP animasi ke MP4.
+ * @param {Buffer} webpBuffer - buffer WebP animated
+ * @param {number} fps - frame rate output (default 15)
+ * @param {number} quality - kualitas video (crf 18-28, default 23)
+ * @returns {Promise<Buffer>}
+ */
+async function webpToMp4(webpBuffer, fps = 15, quality = 23) {
+    const tmpIn = path.join(os.tmpdir(), `webp2mp4_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
+    const tmpOut = path.join(os.tmpdir(), `webp2mp4_out_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
+    fs.writeFileSync(tmpIn, webpBuffer);
+
+    return new Promise((resolve, reject) => {
+        ffmpeg(tmpIn)
+            .inputOptions(['-analyzeduration 10M', '-probesize 10M'])
+            .videoFilter(`fps=${fps},scale=trunc(iw/2)*2:trunc(ih/2)*2`) // pastikan resolusi genap untuk h264
+            .outputOptions([
+                `-crf ${quality}`,
+                '-c:v libx264',
+                '-pix_fmt yuv420p',
+                '-an',
+                '-movflags +faststart'
+            ])
+            .format('mp4')
+            .on('error', (err) => {
+                fs.rmSync(tmpIn, { force: true });
+                reject(new Error(`WebP to MP4 error: ${err.message}`));
+            })
+            .on('end', () => {
+                try {
+                    const buf = fs.readFileSync(tmpOut);
+                    resolve(buf);
+                } catch (e) {
+                    reject(e);
+                } finally {
+                    fs.rmSync(tmpIn, { force: true });
+                    fs.rmSync(tmpOut, { force: true });
+                }
+            })
+            .save(tmpOut);
+    });
+}
+
 // ---------- Handler Utama ----------
 module.exports = async (req, res) => {
   setCorsHeaders(res);
@@ -255,6 +374,74 @@ module.exports = async (req, res) => {
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const { type } = req.query;
+
+// --- WebP ke Gambar (Frame Pertama) ---
+if (type === "webp-to-image") {
+  if (req.method !== "GET")
+    return res.status(405).json({ error: "Hanya mendukung metode GET." });
+
+  const { url, format = "png", quality = 80 } = req.query;
+  if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
+  if (!["png", "jpeg"].includes(format))
+    return res.status(400).json({ error: "Format harus 'png' atau 'jpeg'." });
+  const q = parseInt(quality);
+  if (isNaN(q) || q < 0 || q > 100)
+    return res.status(400).json({ error: "Quality harus 0-100." });
+
+  try {
+    // Download WebP
+    const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
+    const webpBuffer = Buffer.from(response.data);
+
+    // Deteksi animated (opsional, hanya untuk info)
+    const isAnimated = await isWebPAnimated(webpBuffer);
+    const imageBuffer = await extractWebPFrame(webpBuffer, format, q);
+
+    res.setHeader("Content-Type", format === "png" ? "image/png" : "image/jpeg");
+    res.setHeader("Content-Length", imageBuffer.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    res.setHeader("X-WebP-Animated", isAnimated ? "true" : "false");
+    return res.send(imageBuffer);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Gagal mengkonversi WebP ke gambar", detail: err.message });
+  }
+}
+
+// --- WebP Animasi ke Video MP4 ---
+if (type === "webp-to-video") {
+  if (req.method !== "GET")
+    return res.status(405).json({ error: "Hanya mendukung metode GET." });
+
+  const { url, fps = 15, quality = 23 } = req.query;
+  if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
+  let fpsNum = parseInt(fps);
+  if (isNaN(fpsNum) || fpsNum < 1 || fpsNum > 60) fpsNum = 15;
+  let crf = parseInt(quality);
+  if (isNaN(crf) || crf < 18 || crf > 28) crf = 23;
+
+  try {
+    const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
+    const webpBuffer = Buffer.from(response.data);
+
+    // Deteksi apakah WebP benar-benar animasi
+    const isAnimated = await isWebPAnimated(webpBuffer);
+    if (!isAnimated) {
+      return res.status(400).json({
+        error: "WebP tidak bersifat animasi. Gunakan 'webp-to-image' untuk mengambil frame pertama."
+      });
+    }
+
+    const mp4Buffer = await webpToMp4(webpBuffer, fpsNum, crf);
+    res.setHeader("Content-Type", "video/mp4");
+    res.setHeader("Content-Length", mp4Buffer.length);
+    res.setHeader("Cache-Control", "public, max-age=3600");
+    return res.send(mp4Buffer);
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ error: "Gagal mengkonversi WebP animasi ke video", detail: err.message });
+  }
+}
 
   // --- CONVERT ---
   if (type === "convert") {
