@@ -325,33 +325,34 @@ async function extractWebPFrame(webpBuffer, format = 'png', quality = 80) {
     });
 }
 
-/**
- * Konversi WebP animasi ke MP4.
- * @param {Buffer} webpBuffer - buffer WebP animated
- * @param {number} fps - frame rate output (default 15)
- * @param {number} quality - kualitas video (crf 18-28, default 23)
- * @returns {Promise<Buffer>}
- */
 async function webpToMp4(webpBuffer, fps = 15, quality = 23) {
     const tmpIn = path.join(os.tmpdir(), `webp2mp4_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
     const tmpOut = path.join(os.tmpdir(), `webp2mp4_out_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
     fs.writeFileSync(tmpIn, webpBuffer);
 
     return new Promise((resolve, reject) => {
+        // Gunakan input format webp secara eksplisit
         ffmpeg(tmpIn)
-            .inputOptions(['-analyzeduration 10M', '-probesize 10M'])
-            .videoFilter(`fps=${fps},scale=trunc(iw/2)*2:trunc(ih/2)*2`) // pastikan resolusi genap untuk h264
+            .inputOptions([
+                '-f webp',           // force format webp
+                '-analyzeduration 10M',
+                '-probesize 10M'
+            ])
             .outputOptions([
+                `-r ${fps}`,         // set frame rate output
                 `-crf ${quality}`,
                 '-c:v libx264',
                 '-pix_fmt yuv420p',
                 '-an',
-                '-movflags +faststart'
+                '-movflags +faststart',
+                '-vsync cfr'         // constant frame rate
             ])
+            .videoFilter('scale=trunc(iw/2)*2:trunc(ih/2)*2') // pastikan genap
             .format('mp4')
             .on('error', (err) => {
                 fs.rmSync(tmpIn, { force: true });
-                reject(new Error(`WebP to MP4 error: ${err.message}`));
+                // Coba fallback: konversi dengan metode berbeda (tanpa filter fps)
+                fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve);
             })
             .on('end', () => {
                 try {
@@ -366,6 +367,32 @@ async function webpToMp4(webpBuffer, fps = 15, quality = 23) {
             })
             .save(tmpOut);
     });
+}
+
+// Fallback jika metode utama gagal
+function fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve) {
+    ffmpeg(tmpIn)
+        .inputOptions(['-f webp'])
+        .outputOptions([
+            `-r ${fps}`,
+            '-c:v libx264',
+            '-pix_fmt yuv420p',
+            '-an',
+            '-movflags +faststart',
+            '-preset ultrafast'
+        ])
+        .noVideoFilter()
+        .format('mp4')
+        .on('error', (err) => {
+            reject(new Error(`WebP to MP4 fallback error: ${err.message}`));
+        })
+        .on('end', () => {
+            try {
+                const buf = fs.readFileSync(tmpOut);
+                resolve(buf);
+            } catch (e) { reject(e); }
+        })
+        .save(tmpOut);
 }
 
 // ---------- Handler Utama ----------
