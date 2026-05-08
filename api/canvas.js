@@ -395,13 +395,11 @@ if (type === "webp-to-image") {
     const webpBuffer = Buffer.from(response.data);
 
     // Deteksi animated (opsional, hanya untuk info)
-    const isAnimated = await isWebPAnimated(webpBuffer);
     const imageBuffer = await extractWebPFrame(webpBuffer, format, q);
 
     res.setHeader("Content-Type", format === "png" ? "image/png" : "image/jpeg");
     res.setHeader("Content-Length", imageBuffer.length);
     res.setHeader("Cache-Control", "public, max-age=3600");
-    res.setHeader("X-WebP-Animated", isAnimated ? "true" : "false");
     return res.send(imageBuffer);
   } catch (err) {
     console.error(err);
@@ -424,14 +422,6 @@ if (type === "webp-to-video") {
     try {
         const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
         const webpBuffer = Buffer.from(response.data);
-
-        // Deteksi animasi via buffer (opsional, bisa diskip)
-        const isAnimated = isWebPAnimatedByBuffer(webpBuffer);
-        if (!isAnimated) {
-            return res.status(400).json({
-                error: "WebP tidak bersifat animasi. Gunakan 'webp-to-image' untuk mengambil frame pertama."
-            });
-        }
 
         const mp4Buffer = await webpToMp4(webpBuffer, fpsNum, crf);
         // Validasi hasil: jika ukuran sangat kecil (misal < 1KB), mungkin gagal
