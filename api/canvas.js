@@ -331,27 +331,25 @@ async function webpToMp4(webpBuffer, fps = 15, quality = 23) {
     fs.writeFileSync(tmpIn, webpBuffer);
 
     return new Promise((resolve, reject) => {
-        // Gunakan input format webp secara eksplisit
         ffmpeg(tmpIn)
             .inputOptions([
-                '-f webp',           // force format webp
+                '-f webp',
                 '-analyzeduration 10M',
                 '-probesize 10M'
             ])
             .outputOptions([
-                `-r ${fps}`,         // set frame rate output
+                `-r ${fps}`,
                 `-crf ${quality}`,
                 '-c:v libx264',
                 '-pix_fmt yuv420p',
                 '-an',
                 '-movflags +faststart',
-                '-vsync cfr'         // constant frame rate
+                '-vsync cfr'
             ])
-            .videoFilter('scale=trunc(iw/2)*2:trunc(ih/2)*2') // pastikan genap
+            .videoFilter('scale=trunc(iw/2)*2:trunc(ih/2)*2')
             .format('mp4')
             .on('error', (err) => {
                 fs.rmSync(tmpIn, { force: true });
-                // Coba fallback: konversi dengan metode berbeda (tanpa filter fps)
                 fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve);
             })
             .on('end', () => {
@@ -369,7 +367,6 @@ async function webpToMp4(webpBuffer, fps = 15, quality = 23) {
     });
 }
 
-// Fallback jika metode utama gagal
 function fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve) {
     ffmpeg(tmpIn)
         .inputOptions(['-f webp'])
@@ -381,7 +378,7 @@ function fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve) {
             '-movflags +faststart',
             '-preset ultrafast'
         ])
-        .noVideoFilter()
+        // Hapus .noVideoFilter() - gunakan format langsung
         .format('mp4')
         .on('error', (err) => {
             reject(new Error(`WebP to MP4 fallback error: ${err.message}`));
