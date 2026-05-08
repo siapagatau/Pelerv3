@@ -6,15 +6,21 @@ const {
   loadImage,
   LeaderboardBuilder,
 } = require("canvacord");
-const ffmpeg = require("fluent-ffmpeg");
-const ffmpegPath = require("ffmpeg-static");
+//const ffmpeg = require("fluent-ffmpeg");
+//const ffmpegPath = require("ffmpeg-static");
 const axios = require("axios");
 const { PassThrough } = require("stream");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegPath = require("ffmpeg-static");
+const ffprobePath = require("ffprobe-static").path || ffmpegPath.replace("ffmpeg", "ffprobe");
+
 ffmpeg.setFfmpegPath(ffmpegPath);
+ffmpeg.setFfprobePath(ffprobePath);
+
 Font.loadDefault();
 
 // ---------- Custom Greetings Card ----------
