@@ -13,9 +13,9 @@ const { PassThrough } = require("stream");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
+const sharp = require("sharp"); // ✅ tambahkan sharp untuk konversi WebP ke gambar
 
 ffmpeg.setFfmpegPath(ffmpegPath);
-
 Font.loadDefault();
 
 // ---------- Custom Greetings Card ----------
@@ -71,17 +71,8 @@ function setCorsHeaders(res) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
 }
 
-/**
- * Jalankan satu kali konversi WebP animated dengan opsi tertentu.
- * @param {Stream} inputStream
- * @param {object} opts
- * @param {number} opts.quality - 0–100
- * @param {number} opts.fps     - frame per second (0 = ikuti asli)
- * @param {number} opts.width   - lebar output px (0 = gunakan 512x512 default)
- * @returns {Promise<Buffer>}
- */
+// ==================== WEBP CONVERT (ffmpeg) ====================
 function _runConvertToWebP(inputBuffer, { quality, fps = 0, width = 0 }) {
-  // Tulis buffer ke tmp file agar FFmpeg bisa baca WebP animated dengan benar
   const tmpIn  = path.join(os.tmpdir(), `conv_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
   const tmpOut = path.join(os.tmpdir(), `conv_out_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
   fs.writeFileSync(tmpIn, inputBuffer);
@@ -125,29 +116,13 @@ function _runConvertToWebP(inputBuffer, { quality, fps = 0, width = 0 }) {
   });
 }
 
-/**
- * Konversi URL → animated WebP, auto-kecilkan jika hasil > maxSize (default 1MB).
- *
- * Urutan strategi (ringan → agresif):
- *   Tahap 1 – turunkan FPS saja : 0 (asli) → 24 → 20 → 15 → 12 → 10 → 8 → 6 → 5 → 3 → 2 → 1
- *
- * Loop berhenti segera saat buffer ≤ maxSize.
- * Jika FFmpeg gagal atau semua opsi habis → kembalikan buffer ASLI (tidak dikonversi).
- *
- * @param {string} url
- * @param {number} quality  - kualitas awal (0–100), default 80
- * @param {number} maxSize  - batas bytes, default 1 MB
- * @returns {Promise<{ buffer: Buffer, contentType: string, isOriginal: boolean }>}
- */
 async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
-  // Download buffer asli SEKALI sebagai sumber + fallback
   const originalResponse = await axios({ method: "GET", url, responseType: "arraybuffer" });
   const originalBuffer   = Buffer.from(originalResponse.data);
   const originalType     = originalResponse.headers["content-type"] || "application/octet-stream";
 
   console.log(`[convert] Original: ${(originalBuffer.length / 1024 / 1024).toFixed(2)}MB type=${originalType}`);
 
-  // Coba dari fps asli (0), lalu turunkan bertahap sampai muat
   for (const fps of [0, 24, 20, 15, 12, 10, 8, 6, 5, 3, 2, 1]) {
     try {
       const buf = await _runConvertToWebP(originalBuffer, { quality, fps, width: 0 });
@@ -165,41 +140,24 @@ async function convertToWebP(url, quality = 80, maxSize = 1 * 1024 * 1024) {
     }
   }
 
-  // Semua opsi habis → kembalikan buffer asli tanpa konversi
-  console.warn(
-    `[convert] ⚠️ Semua opsi fps habis, mengembalikan buffer asli.` +
-    ` Ukuran asli: ${(originalBuffer.length / 1024 / 1024).toFixed(2)}MB` +
-    ` (limit: ${(maxSize / 1024 / 1024).toFixed(2)}MB)`
-  );
+  console.warn(`[convert] ⚠️ Semua opsi fps habis, mengembalikan buffer asli. Ukuran asli: ${(originalBuffer.length / 1024 / 1024).toFixed(2)}MB`);
   return { buffer: originalBuffer, contentType: originalType, isOriginal: true };
 }
 
-/**
- * Kompres gambar ke JPEG/WebP max 100KB tanpa stretch.
- * Aspect ratio dipertahankan, resolusi diturunkan jika perlu.
- * @param {string} url     - URL gambar
- * @param {number} maxSize - Batas ukuran dalam bytes (default: 100KB)
- * @returns {Promise<Buffer>}
- */
+// ==================== COMPRESS IMAGE ====================
 async function compressImage(url, maxSize = 100 * 1024) {
   const response = await axios({ method: "GET", url, responseType: "stream" });
-
-  // Tahap 1: coba quality tinggi dulu, turunkan bertahap sampai muat
   const qualities = [80, 65, 50, 35, 20];
 
   for (const quality of qualities) {
     const result = await _runCompress(response.data.pipe(new PassThrough()), quality);
     if (result.length <= maxSize) return result;
-
-    // response.data sudah dipakai, harus fetch ulang untuk iterasi berikutnya
     if (quality !== qualities[qualities.length - 1]) {
       const retry = await axios({ method: "GET", url, responseType: "stream" });
       response.data = retry.data;
     }
   }
 
-  // Tahap 2: jika masih > maxSize setelah quality terkecil,
-  // turunkan resolusi (scale down) sambil tetap jaga aspect ratio
   const scales = [0.75, 0.5, 0.35, 0.25];
   for (const scale of scales) {
     const retry = await axios({ method: "GET", url, responseType: "stream" });
@@ -207,25 +165,16 @@ async function compressImage(url, maxSize = 100 * 1024) {
     if (result.length <= maxSize) return result;
   }
 
-  // Kembalikan hasil terkecil yang bisa dihasilkan (scale 0.25 + quality 20)
   const last = await axios({ method: "GET", url, responseType: "stream" });
   return _runCompress(last.data, 20, 0.25);
 }
 
-/**
- * Internal: jalankan satu kali ffmpeg compress
- * @param {Stream} inputStream
- * @param {number} quality   - 0-100
- * @param {number|null} scale - misal 0.5 = setengah resolusi asli, null = tidak resize
- */
 function _runCompress(inputStream, quality, scale = null) {
   const outputStream = new PassThrough();
   const chunks = [];
-
-  // scale=iw*{scale}:ih*{scale} → proportional, tidak stretch
   const scaleFilter = scale
     ? `scale=iw*${scale}:ih*${scale}:flags=lanczos`
-    : "scale=iw:ih:flags=lanczos"; // no-op tapi tetap jaga pixel format
+    : "scale=iw:ih:flags=lanczos";
 
   return new Promise((resolve, reject) => {
     outputStream.on("data", (chunk) => chunks.push(chunk));
@@ -236,12 +185,12 @@ function _runCompress(inputStream, quality, scale = null) {
       .inputOptions(["-analyzeduration 10M", "-probesize 10M"])
       .videoFilter(scaleFilter)
       .outputOptions([
-        "-c:v libwebp",   // WebP lebih efisien dari JPEG untuk ukuran kecil
+        "-c:v libwebp",
         `-quality ${quality}`,
         "-loop 0",
         "-preset picture",
         "-an",
-        "-vframes 1",     // ambil 1 frame saja (untuk GIF/video → ambil frame pertama)
+        "-vframes 1",
       ])
       .format("webp")
       .on("error", (err) => reject(new Error(`FFmpeg compress error: ${err.message}`)))
@@ -249,236 +198,66 @@ function _runCompress(inputStream, quality, scale = null) {
   });
 }
 
-// ---------- Helper: Deteksi WebP Animated ----------
-/**
- * Deteksi apakah sebuah WebP (URL atau buffer) bersifat animated.
- * Menggunakan ffprobe untuk membaca jumlah frame.
- * @param {string|Buffer} input - URL atau buffer data WebP
- * @returns {Promise<boolean>}
- */
-async function isWebPAnimated(input) {
-    return new Promise(async (resolve, reject) => {
-        try {
-            let inputPath = input;
-            let isTemp = false;
-            if (Buffer.isBuffer(input)) {
-                const tmpPath = path.join(os.tmpdir(), `webp_probe_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
-                fs.writeFileSync(tmpPath, input);
-                inputPath = tmpPath;
-                isTemp = true;
-            }
-
-            const ffprobe = require('fluent-ffmpeg').ffprobe;
-            ffprobe(inputPath, (err, metadata) => {
-                if (isTemp) fs.rmSync(inputPath, { force: true });
-                if (err) return reject(err);
-                // Video stream memiliki "nb_frames" > 1 untuk animasi WebP
-                const videoStream = metadata.streams.find(s => s.codec_type === 'video');
-                const frameCount = videoStream?.nb_frames ? parseInt(videoStream.nb_frames) : 0;
-                resolve(frameCount > 1);
-            });
-        } catch (err) {
-            reject(err);
-        }
-    });
-}
-
-/**
- * Ekstrak frame pertama dari WebP (statis atau animasi) ke PNG/JPEG.
- * @param {Buffer} webpBuffer - buffer WebP
- * @param {string} format - 'png' atau 'jpeg'
- * @param {number} quality - 0-100 (hanya untuk JPEG)
- * @returns {Promise<Buffer>}
- */
-async function extractWebPFrame(webpBuffer, format = 'png', quality = 80) {
-    const tmpIn = path.join(os.tmpdir(), `extract_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
-    const tmpOut = path.join(os.tmpdir(), `extract_out_${Date.now()}_${Math.random().toString(36).slice(2)}.${format}`);
-    fs.writeFileSync(tmpIn, webpBuffer);
-
-    return new Promise((resolve, reject) => {
-        let cmd = ffmpeg(tmpIn)
-            .inputOptions(['-analyzeduration 10M', '-probesize 10M'])
-            .outputOptions(['-vframes 1', '-an']);
-
-        if (format === 'jpeg') {
-            cmd = cmd.outputOptions([`-quality ${quality}`]).format('mjpeg');
-        } else {
-            cmd = cmd.format('png');
-        }
-
-        cmd.on('error', (err) => {
-            fs.rmSync(tmpIn, { force: true });
-            reject(new Error(`Extract frame error: ${err.message}`));
-        })
-        .on('end', () => {
-            try {
-                const buf = fs.readFileSync(tmpOut);
-                resolve(buf);
-            } catch (e) {
-                reject(e);
-            } finally {
-                fs.rmSync(tmpIn, { force: true });
-                fs.rmSync(tmpOut, { force: true });
-            }
-        })
-        .save(tmpOut);
-    });
-}
-
-async function webpToMp4(webpBuffer, fps = 15, quality = 23) {
-    const tmpIn = path.join(os.tmpdir(), `webp2mp4_in_${Date.now()}_${Math.random().toString(36).slice(2)}.webp`);
-    const tmpOut = path.join(os.tmpdir(), `webp2mp4_out_${Date.now()}_${Math.random().toString(36).slice(2)}.mp4`);
-    fs.writeFileSync(tmpIn, webpBuffer);
-
-    return new Promise((resolve, reject) => {
-        ffmpeg(tmpIn)
-            .inputOptions([
-                '-f webp',
-                '-analyzeduration 10M',
-                '-probesize 10M'
-            ])
-            .outputOptions([
-                `-r ${fps}`,
-                `-crf ${quality}`,
-                '-c:v libx264',
-                '-pix_fmt yuv420p',
-                '-an',
-                '-movflags +faststart',
-                '-vsync cfr'
-            ])
-            .videoFilter('scale=trunc(iw/2)*2:trunc(ih/2)*2')
-            .format('mp4')
-            .on('error', (err) => {
-                fs.rmSync(tmpIn, { force: true });
-                fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve);
-            })
-            .on('end', () => {
-                try {
-                    const buf = fs.readFileSync(tmpOut);
-                    resolve(buf);
-                } catch (e) {
-                    reject(e);
-                } finally {
-                    fs.rmSync(tmpIn, { force: true });
-                    fs.rmSync(tmpOut, { force: true });
-                }
-            })
-            .save(tmpOut);
-    });
-}
-
-function fallbackConvert(tmpIn, tmpOut, fps, quality, reject, resolve) {
-    ffmpeg(tmpIn)
-        .inputOptions(['-f webp'])
-        .outputOptions([
-            `-r ${fps}`,
-            '-c:v libx264',
-            '-pix_fmt yuv420p',
-            '-an',
-            '-movflags +faststart',
-            '-preset ultrafast'
-        ])
-        // Hapus .noVideoFilter() - gunakan format langsung
-        .format('mp4')
-        .on('error', (err) => {
-            reject(new Error(`WebP to MP4 fallback error: ${err.message}`));
-        })
-        .on('end', () => {
-            try {
-                const buf = fs.readFileSync(tmpOut);
-                resolve(buf);
-            } catch (e) { reject(e); }
-        })
-        .save(tmpOut);
-}
-
-// ---------- Handler Utama ----------
+// ==================== HANDLER UTAMA ====================
 module.exports = async (req, res) => {
   setCorsHeaders(res);
-
   if (req.method === "OPTIONS") return res.status(200).end();
 
   const { type } = req.query;
 
-// --- WebP ke Gambar (Frame Pertama) ---
-if (type === "webp-to-image") {
-  if (req.method !== "GET")
-    return res.status(405).json({ error: "Hanya mendukung metode GET." });
-
-  const { url, format = "png", quality = 80 } = req.query;
-  if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-  if (!["png", "jpeg"].includes(format))
-    return res.status(400).json({ error: "Format harus 'png' atau 'jpeg'." });
-  const q = parseInt(quality);
-  if (isNaN(q) || q < 0 || q > 100)
-    return res.status(400).json({ error: "Quality harus 0-100." });
-
-  try {
-    // Download WebP
-    const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
-    const webpBuffer = Buffer.from(response.data);
-
-    // Deteksi animated (opsional, hanya untuk info)
-    const imageBuffer = await extractWebPFrame(webpBuffer, format, q);
-
-    res.setHeader("Content-Type", format === "png" ? "image/png" : "image/jpeg");
-    res.setHeader("Content-Length", imageBuffer.length);
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    return res.send(imageBuffer);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Gagal mengkonversi WebP ke gambar", detail: err.message });
-  }
-}
-
-// --- WebP Animasi ke Video MP4 (tanpa ffprobe) ---
-if (type === "webp-to-video") {
+  // ---------- WEBP TO IMAGE (SHARP, SUPPORT VERCEL) ----------
+  if (type === "webp-to-image") {
     if (req.method !== "GET")
-        return res.status(405).json({ error: "Hanya mendukung metode GET." });
+      return res.status(405).json({ error: "Hanya mendukung metode GET." });
 
-    const { url, fps = 15, quality = 23 } = req.query;
+    const { url, format = "png", quality = 80 } = req.query;
     if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-    let fpsNum = parseInt(fps);
-    if (isNaN(fpsNum) || fpsNum < 1 || fpsNum > 60) fpsNum = 15;
-    let crf = parseInt(quality);
-    if (isNaN(crf) || crf < 18 || crf > 28) crf = 23;
+    if (!["png", "jpeg"].includes(format))
+      return res.status(400).json({ error: "Format harus 'png' atau 'jpeg'." });
+    const q = parseInt(quality);
+    if (isNaN(q) || q < 0 || q > 100)
+      return res.status(400).json({ error: "Quality harus 0-100." });
 
     try {
-        const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
-        const webpBuffer = Buffer.from(response.data);
+      const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
+      const webpBuffer = Buffer.from(response.data);
+      let transformer = sharp(webpBuffer);
+      if (format === "png") {
+        transformer = transformer.png({ quality: q, compressionLevel: 9 });
+      } else {
+        transformer = transformer.jpeg({ quality: q, mozjpeg: true });
+      }
+      const imageBuffer = await transformer.toBuffer();
 
-        const mp4Buffer = await webpToMp4(webpBuffer, fpsNum, crf);
-        // Validasi hasil: jika ukuran sangat kecil (misal < 1KB), mungkin gagal
-        if (mp4Buffer.length < 1024) {
-            throw new Error("Hasil konversi terlalu kecil, mungkin bukan WebP animasi yang valid");
-        }
-        res.setHeader("Content-Type", "video/mp4");
-        res.setHeader("Content-Length", mp4Buffer.length);
-        res.setHeader("Cache-Control", "public, max-age=3600");
-        return res.send(mp4Buffer);
+      res.setHeader("Content-Type", format === "png" ? "image/png" : "image/jpeg");
+      res.setHeader("Content-Length", imageBuffer.length);
+      res.setHeader("Cache-Control", "public, max-age=3600");
+      return res.send(imageBuffer);
     } catch (err) {
-        console.error(err);
-        return res.status(500).json({ error: "Gagal mengkonversi WebP animasi ke video", detail: err.message });
+      console.error(err);
+      return res.status(500).json({ error: "Gagal mengkonversi WebP ke gambar", detail: err.message });
     }
-}
+  }
 
-  // --- CONVERT ---
+  // ---------- WEBP TO VIDEO (TIDAK DIDUKUNG DI VERCEL) ----------
+  if (type === "webp-to-video") {
+    return res.status(501).json({
+      error: "Fitur konversi WebP animasi ke video tidak didukung di environment Vercel.",
+      suggestion: "Gunakan mode termux atau server dengan ffmpeg lengkap."
+    });
+  }
+
+  // ---------- CONVERT URL TO WEBP (ANIMATED) ----------
   if (type === "convert") {
     if (req.method !== "GET")
       return res.status(405).json({ error: "Convert hanya mendukung metode GET." });
 
     const { url, quality, maxsize } = req.query;
     if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-
-    try { new URL(url); } catch {
-      return res.status(400).json({ error: "URL tidak valid." });
-    }
+    try { new URL(url); } catch { return res.status(400).json({ error: "URL tidak valid." }); }
 
     const q = parseInt(quality) || 80;
-    if (q < 0 || q > 100)
-      return res.status(400).json({ error: "Quality harus antara 0-100." });
-
-    // maxsize opsional (bytes), default 1MB
+    if (q < 0 || q > 100) return res.status(400).json({ error: "Quality harus antara 0-100." });
     const maxBytes = parseInt(maxsize) || 1 * 1024 * 1024;
     if (maxBytes < 1024 || maxBytes > 50 * 1024 * 1024)
       return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 52428800 (50MB)." });
@@ -497,19 +276,15 @@ if (type === "webp-to-video") {
     }
   }
 
-  // --- COMPRESS ---
+  // ---------- COMPRESS IMAGE ----------
   if (type === "compress") {
     if (req.method !== "GET")
       return res.status(405).json({ error: "Compress hanya mendukung metode GET." });
 
     const { url, maxsize } = req.query;
     if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
+    try { new URL(url); } catch { return res.status(400).json({ error: "URL tidak valid." }); }
 
-    try { new URL(url); } catch {
-      return res.status(400).json({ error: "URL tidak valid." });
-    }
-
-    // maxsize opsional (bytes), default 100KB
     const maxBytes = parseInt(maxsize) || 100 * 1024;
     if (maxBytes < 1024 || maxBytes > 10 * 1024 * 1024)
       return res.status(400).json({ error: "maxsize harus antara 1024 (1KB) hingga 10485760 (10MB)." });
@@ -527,7 +302,7 @@ if (type === "webp-to-video") {
     }
   }
 
-  // --- LEADERBOARD ---
+  // ---------- LEADERBOARD (POST) ----------
   if (type === "leaderboard") {
     if (req.method !== "POST")
       return res.status(405).json({ error: "Leaderboard requires POST method." });
@@ -546,7 +321,6 @@ if (type === "webp-to-video") {
       const lb = new LeaderboardBuilder()
         .setHeader(safeHeader)
         .setPlayers(players.slice(0, 10));
-
       if (background) lb.setBackground(background);
       lb.setVariant(variant === "horizontal" ? "horizontal" : "default");
 
@@ -560,16 +334,14 @@ if (type === "webp-to-video") {
     }
   }
 
-  // --- RANK / WELCOME / GOODBYE ---
+  // ---------- RANK / WELCOME / GOODBYE (GET) ----------
   if (req.method !== "GET")
     return res.status(405).json({ error: "Method not allowed." });
-
   if (!type)
     return res.status(400).json({ error: "Missing 'type' parameter." });
 
   try {
     let imageBuffer;
-
     if (type === "rank") {
       const { username, displayName, avatar, currentXP, requiredXP, level, rank, status, background } = req.query;
       const card = new RankCardBuilder()
