@@ -6,20 +6,15 @@ const {
   loadImage,
   LeaderboardBuilder,
 } = require("canvacord");
-//const ffmpeg = require("fluent-ffmpeg");
-//const ffmpegPath = require("ffmpeg-static");
+const ffmpeg = require("fluent-ffmpeg");
+const ffmpegPath = require("ffmpeg-static");
 const axios = require("axios");
 const { PassThrough } = require("stream");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
 
-const ffmpeg = require("fluent-ffmpeg");
-const ffmpegPath = require("ffmpeg-static");
-const ffprobePath = require("ffprobe-static").path || ffmpegPath.replace("ffmpeg", "ffprobe");
-
 ffmpeg.setFfmpegPath(ffmpegPath);
-ffmpeg.setFfprobePath(ffprobePath);
 
 Font.loadDefault();
 
@@ -414,39 +409,43 @@ if (type === "webp-to-image") {
   }
 }
 
-// --- WebP Animasi ke Video MP4 ---
+// --- WebP Animasi ke Video MP4 (tanpa ffprobe) ---
 if (type === "webp-to-video") {
-  if (req.method !== "GET")
-    return res.status(405).json({ error: "Hanya mendukung metode GET." });
+    if (req.method !== "GET")
+        return res.status(405).json({ error: "Hanya mendukung metode GET." });
 
-  const { url, fps = 15, quality = 23 } = req.query;
-  if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
-  let fpsNum = parseInt(fps);
-  if (isNaN(fpsNum) || fpsNum < 1 || fpsNum > 60) fpsNum = 15;
-  let crf = parseInt(quality);
-  if (isNaN(crf) || crf < 18 || crf > 28) crf = 23;
+    const { url, fps = 15, quality = 23 } = req.query;
+    if (!url) return res.status(400).json({ error: "Parameter 'url' wajib diisi." });
+    let fpsNum = parseInt(fps);
+    if (isNaN(fpsNum) || fpsNum < 1 || fpsNum > 60) fpsNum = 15;
+    let crf = parseInt(quality);
+    if (isNaN(crf) || crf < 18 || crf > 28) crf = 23;
 
-  try {
-    const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
-    const webpBuffer = Buffer.from(response.data);
+    try {
+        const response = await axios({ method: "GET", url, responseType: "arraybuffer" });
+        const webpBuffer = Buffer.from(response.data);
 
-    // Deteksi apakah WebP benar-benar animasi
-    const isAnimated = await isWebPAnimated(webpBuffer);
-    if (!isAnimated) {
-      return res.status(400).json({
-        error: "WebP tidak bersifat animasi. Gunakan 'webp-to-image' untuk mengambil frame pertama."
-      });
+        // Deteksi animasi via buffer (opsional, bisa diskip)
+        const isAnimated = isWebPAnimatedByBuffer(webpBuffer);
+        if (!isAnimated) {
+            return res.status(400).json({
+                error: "WebP tidak bersifat animasi. Gunakan 'webp-to-image' untuk mengambil frame pertama."
+            });
+        }
+
+        const mp4Buffer = await webpToMp4(webpBuffer, fpsNum, crf);
+        // Validasi hasil: jika ukuran sangat kecil (misal < 1KB), mungkin gagal
+        if (mp4Buffer.length < 1024) {
+            throw new Error("Hasil konversi terlalu kecil, mungkin bukan WebP animasi yang valid");
+        }
+        res.setHeader("Content-Type", "video/mp4");
+        res.setHeader("Content-Length", mp4Buffer.length);
+        res.setHeader("Cache-Control", "public, max-age=3600");
+        return res.send(mp4Buffer);
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({ error: "Gagal mengkonversi WebP animasi ke video", detail: err.message });
     }
-
-    const mp4Buffer = await webpToMp4(webpBuffer, fpsNum, crf);
-    res.setHeader("Content-Type", "video/mp4");
-    res.setHeader("Content-Length", mp4Buffer.length);
-    res.setHeader("Cache-Control", "public, max-age=3600");
-    return res.send(mp4Buffer);
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({ error: "Gagal mengkonversi WebP animasi ke video", detail: err.message });
-  }
 }
 
   // --- CONVERT ---
